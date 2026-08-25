@@ -1,0 +1,62 @@
+[project]
+name = "hr-etl"
+version = "0.1.0"
+description = "ETL pipeline for HR Insights: Kafka -> MongoDB (lake) -> PostgreSQL (warehouse)"
+requires-python = ">=3.12"
+dependencies = [
+    "confluent-kafka==2.6.1",
+    "pymongo==4.10.1",
+    "SQLAlchemy==2.0.36",
+    "psycopg2-binary==2.9.10",
+    "redis==5.2.1",
+    "pydantic==2.10.4",
+    "pydantic-settings==2.7.1",
+    "prometheus-client==0.21.1",
+    "fastapi==0.115.6",
+    "uvicorn==0.34.0",
+    "python-dotenv==1.0.1",
+]
+
+[project.optional-dependencies]
+frontend = [
+    "streamlit==1.41.1",
+    "requests==2.32.3",
+]
+dev = [
+    "pytest==8.3.4",
+    "pytest-cov==6.0.0",
+    "mongomock==4.3.0",
+    "fakeredis==2.26.2",
+    "httpx==0.28.1",
+    "ruff==0.8.4",
+    "black==24.10.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=src/hr_etl --cov-report=term-missing --cov-report=xml"
+
+[tool.coverage.run]
+branch = true
+source = ["src/hr_etl"]
+omit = [
+    # Pure wiring entrypoints that require live infra (Kafka/Mongo/Postgres/Redis);
+    # exercised via docker-compose, not unit tests.
+    "src/hr_etl/__main__.py",
+    "src/hr_etl/api/main.py",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
