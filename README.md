@@ -48,6 +48,11 @@ Detalle completo en `.kiro/pipeline/architecture.md`.
    Servicios: `app` (ETL), `api` (http://localhost:8000), `frontend` (http://localhost:8501),
    `mongo`, `postgres`, `redis`, `prometheus` (http://localhost:9090).
 
+   El arranque es ordenado: `mongo`, `postgres` y `redis` tienen healthchecks y los servicios
+   `app`/`api` esperan (`depends_on: condition: service_healthy`) a que las bases de datos estén
+   listas antes de arrancar, evitando fallos de conexión en el primer `up`. Todos los servicios
+   usan `restart: unless-stopped`.
+
 ## Desarrollo local (sin Docker)
 
 ```
