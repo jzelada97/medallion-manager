@@ -42,6 +42,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--cov=src/hr_etl --cov-report=term-missing --cov-report=xml"
+markers = [
+    "integration: tests that require live infrastructure (Postgres/Mongo/Redis). Skipped if unavailable.",
+]
 
 [tool.coverage.run]
 branch = true
