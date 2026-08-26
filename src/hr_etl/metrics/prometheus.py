@@ -1,8 +1,15 @@
-"""Prometheus metric definitions for the ETL pipeline."""
+"""Prometheus metric definitions for the ETL pipeline.
+
+These instruments answer the questions asked by the project brief:
+- how many messages are consumed (and of which type),
+- at what rate (derive with rate() over the counters in Prometheus),
+- how long processing takes, and how long persistence takes,
+- how many consolidated persons were written, and how many messages failed.
+"""
 
 from __future__ import annotations
 
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 MESSAGES_CONSUMED = Counter(
     "hr_etl_messages_consumed_total",
@@ -22,10 +29,20 @@ PERSONS_PERSISTED = Counter(
 
 PROCESSING_SECONDS = Histogram(
     "hr_etl_processing_seconds",
-    "Time spent processing a single message",
+    "Time spent processing a single message end to end",
 )
 
 PERSIST_SECONDS = Histogram(
     "hr_etl_persist_seconds",
-    "Time spent persisting a consolidated person",
+    "Time spent persisting a consolidated person into the warehouse",
+)
+
+CONSOLIDATIONS = Counter(
+    "hr_etl_consolidations_total",
+    "Total consolidation attempts that produced a person record",
+)
+
+PENDING_FRAGMENTS = Gauge(
+    "hr_etl_pending_fragments",
+    "Fragments currently buffered for a person key awaiting consolidation",
 )

@@ -21,6 +21,10 @@ htmlcov/
 *.env
 !.env.example
 
+# Local-only notes / roadmap (NOT for the repo, personal working notes)
+ROADMAP.local.md
+*.local.md
+
 # IDE / OS
 .vscode/
 .idea/

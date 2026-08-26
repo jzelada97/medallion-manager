@@ -12,8 +12,11 @@ from hr_etl.cache.redis_buffer import RedisBuffer
 from hr_etl.lake.mongo_lake import MongoLake
 from hr_etl.logging_conf import get_logger
 from hr_etl.metrics.prometheus import (
+    CONSOLIDATIONS,
     MESSAGES_CONSUMED,
     MESSAGES_FAILED,
+    PENDING_FRAGMENTS,
+    PERSIST_SECONDS,
     PERSONS_PERSISTED,
     PROCESSING_SECONDS,
 )
@@ -61,6 +64,7 @@ class Pipeline:
                 return None
 
             count = self._buffer.add_fragment(key, message, ftype.value)
+            PENDING_FRAGMENTS.set(count)
             if count < self._min_fragments:
                 return None
 
@@ -68,8 +72,10 @@ class Pipeline:
             person = consolidate(fragments)
             if person is None:
                 return None
+            CONSOLIDATIONS.inc()
 
-            person_id = self._repo.upsert(person)
+            with PERSIST_SECONDS.time():
+                person_id = self._repo.upsert(person)
             PERSONS_PERSISTED.inc()
             return person_id
         except Exception:  # never let one bad message kill the pipeline

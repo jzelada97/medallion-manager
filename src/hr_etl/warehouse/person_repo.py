@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from collections.abc import Iterable
+
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from hr_etl.logging_conf import get_logger
@@ -16,6 +19,15 @@ _FIELDS = (
     "city", "address", "company", "company_address", "company_phone",
     "company_email", "job", "iban", "salary", "ipv4",
 )
+
+
+def _non_empty_values(person: Person) -> dict[str, object]:
+    """Return the person fields that carry a real (non-empty) value."""
+    return {
+        field: getattr(person, field)
+        for field in _FIELDS
+        if getattr(person, field) not in (None, "")
+    }
 
 
 class PersonRepository:
@@ -54,6 +66,65 @@ class PersonRepository:
             session.commit()
             logger.debug("upserted person match_key=%s id=%s", person.match_key, row.id)
             return row.id
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def upsert_native(self, person: Person) -> None:
+        """Idempotent upsert using PostgreSQL ``INSERT ... ON CONFLICT``.
+
+        Performs the whole upsert in a single atomic statement (no SELECT + write
+        race window). Only fills columns that are currently NULL, preserving
+        existing non-empty data via COALESCE(existing, new).
+
+        Requires PostgreSQL. For SQLite/tests use :meth:`upsert`.
+        """
+        if not person.match_key:
+            raise ValueError("Person.match_key is required for upsert")
+        self.upsert_many_native([person])
+
+    def upsert_many_native(self, persons: Iterable[Person]) -> int:
+        """Batch idempotent upsert on PostgreSQL in a single transaction.
+
+        Returns the number of rows sent. The whole batch commits atomically:
+        either all rows are persisted or none (safe to reprocess from the lake).
+        """
+        rows: list[dict[str, object]] = []
+        for person in persons:
+            if not person.match_key:
+                raise ValueError("Person.match_key is required for upsert")
+            non_empty = _non_empty_values(person)
+            # Every row must carry the SAME set of keys for a multi-row INSERT,
+            # so we fill absent fields with None (missing -> NULL). COALESCE on
+            # conflict keeps existing values, so NULLs never overwrite good data.
+            payload = {field: non_empty.get(field) for field in _FIELDS}
+            payload["match_key"] = person.match_key
+            rows.append(payload)
+
+        if not rows:
+            return 0
+
+        session: Session = self._session_factory()
+        try:
+            stmt = pg_insert(PersonRow).values(rows)
+            # On conflict of match_key, keep existing non-null values and only
+            # fill gaps with the incoming value: COALESCE(existing, incoming).
+            # COALESCE(existing, incoming): keep existing value unless it is NULL,
+            # so we only fill gaps and never overwrite good data (idempotent).
+            update_cols = {
+                field: func.coalesce(PersonRow.__table__.c[field], stmt.excluded[field])
+                for field in _FIELDS
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["match_key"],
+                set_=update_cols,
+            )
+            session.execute(stmt)
+            session.commit()
+            logger.debug("native upsert batch size=%d", len(rows))
+            return len(rows)
         except Exception:
             session.rollback()
             raise
