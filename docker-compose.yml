@@ -11,6 +11,13 @@ services:
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_ROOT_PASSWORD:-changeme}
     volumes:
       - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
     networks: [hr_net]
 
   postgres:
@@ -21,11 +28,25 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
     volumes:
       - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hr_user} -d ${POSTGRES_DB:-hr_warehouse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
     networks: [hr_net]
 
   redis:
     image: redis:7
     command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-changeme}"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
     networks: [hr_net]
 
   app:
@@ -33,7 +54,16 @@ services:
       context: .
       dockerfile: docker/Dockerfile.app
     env_file: .env
-    depends_on: [mongo, postgres, redis]
+    depends_on:
+      mongo:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "9100"
+    restart: unless-stopped
     networks: [hr_net]
 
   api:
@@ -43,7 +73,10 @@ services:
     env_file: .env
     ports:
       - "8000:8000"
-    depends_on: [postgres]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
     networks: [hr_net]
 
   frontend:
@@ -55,6 +88,7 @@ services:
     ports:
       - "8501:8501"
     depends_on: [api]
+    restart: unless-stopped
     networks: [hr_net]
 
   prometheus:
@@ -64,6 +98,7 @@ services:
     ports:
       - "9090:9090"
     depends_on: [app, api]
+    restart: unless-stopped
     networks: [hr_net]
 
 volumes:
