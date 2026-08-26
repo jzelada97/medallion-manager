@@ -1,0 +1,39 @@
+# Version control / CI
+.git
+.gitignore
+.github
+
+# Python caches / envs
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Tests / coverage / tooling
+tests/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.scannerwork/
+.ruff_cache/
+
+# Secrets / local env
+.env
+*.env
+!.env.example
+
+# Docs / harness / IDE (not needed at runtime)
+.kiro/
+*.md
+!README.md
+.vscode/
+.idea/
+.DS_Store
+
+# Data
+data/
+dumps/
+*.dump
