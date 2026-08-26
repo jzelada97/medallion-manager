@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from sqlalchemy import select
+from sqlalchemy import func, or_, select
 
 from hr_etl.models.db_models import PersonRow
 
@@ -23,6 +23,9 @@ def _row_to_dict(row: PersonRow) -> dict:
         "city": row.city,
         "address": row.address,
         "company": row.company,
+        "company_address": row.company_address,
+        "company_phone": row.company_phone,
+        "company_email": row.company_email,
         "job": row.job,
         "iban": row.iban,
         "salary": row.salary,
@@ -46,19 +49,54 @@ def build_router(session_factory) -> APIRouter:
     def list_persons(
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
+        q: str | None = Query(None, description="Free-text search on name/company/email"),
         city: str | None = None,
         company: str | None = None,
+        job: str | None = None,
     ) -> dict:
+        """List consolidated persons with filters, free-text search and pagination.
+
+        Returns total (across all matches), plus the requested page of items.
+        """
         session = session_factory()
         try:
-            stmt = select(PersonRow)
+            filters = []
             if city:
-                stmt = stmt.where(PersonRow.city == city.strip().lower())
+                filters.append(PersonRow.city == city.strip().lower())
             if company:
-                stmt = stmt.where(PersonRow.company == company.strip().lower())
-            stmt = stmt.limit(limit).offset(offset)
-            rows = session.execute(stmt).scalars().all()
-            return {"count": len(rows), "items": [_row_to_dict(r) for r in rows]}
+                filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
+            if job:
+                filters.append(PersonRow.job.ilike(f"%{job.strip()}%"))
+            if q:
+                like = f"%{q.strip()}%"
+                filters.append(
+                    or_(
+                        PersonRow.full_name.ilike(like),
+                        PersonRow.name.ilike(like),
+                        PersonRow.lastname.ilike(like),
+                        PersonRow.company.ilike(like),
+                        PersonRow.email.ilike(like),
+                    )
+                )
+
+            base = select(PersonRow)
+            count_stmt = select(func.count()).select_from(PersonRow)
+            for f in filters:
+                base = base.where(f)
+                count_stmt = count_stmt.where(f)
+
+            total = session.execute(count_stmt).scalar_one()
+            rows = session.execute(
+                base.order_by(PersonRow.id).limit(limit).offset(offset)
+            ).scalars().all()
+
+            return {
+                "total": total,
+                "count": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "items": [_row_to_dict(r) for r in rows],
+            }
         finally:
             session.close()
 
@@ -68,8 +106,36 @@ def build_router(session_factory) -> APIRouter:
         try:
             row = session.get(PersonRow, person_id)
             if row is None:
-                return {"error": "not found"}
+                raise HTTPException(status_code=404, detail="person not found")
             return _row_to_dict(row)
+        finally:
+            session.close()
+
+    @router.get("/stats")
+    def stats() -> dict:
+        """Aggregated summary for dashboards/demo: totals and top groupings."""
+        session = session_factory()
+        try:
+            total = session.execute(select(func.count()).select_from(PersonRow)).scalar_one()
+
+            def top(column, limit: int = 5) -> list[dict]:
+                stmt = (
+                    select(column, func.count().label("n"))
+                    .where(column.isnot(None))
+                    .group_by(column)
+                    .order_by(func.count().desc())
+                    .limit(limit)
+                )
+                return [{"value": v, "count": n} for v, n in session.execute(stmt).all()]
+
+            return {
+                "total_persons": total,
+                "top_cities": top(PersonRow.city),
+                "top_companies": top(PersonRow.company),
+                "with_bank": session.execute(
+                    select(func.count()).select_from(PersonRow).where(PersonRow.iban.isnot(None))
+                ).scalar_one(),
+            }
         finally:
             session.close()
 

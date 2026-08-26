@@ -59,10 +59,12 @@ pytestmark = [
 @pytest.fixture()
 def pg_session_factory():
     engine = create_db_engine(DSN)
+    # Start from a clean schema so tests don't depend on pre-existing data
+    # (e.g. seed data inserted manually into the same Postgres).
+    Base.metadata.drop_all(engine)
     init_schema(engine)
     factory = make_session_factory(engine)
     yield factory
-    # cleanup: drop the table so repeated runs start clean
     Base.metadata.drop_all(engine)
     engine.dispose()
 

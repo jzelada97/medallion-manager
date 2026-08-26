@@ -95,7 +95,11 @@ class PersonRepository:
         for person in persons:
             if not person.match_key:
                 raise ValueError("Person.match_key is required for upsert")
-            payload = _non_empty_values(person)
+            non_empty = _non_empty_values(person)
+            # Every row must carry the SAME set of keys for a multi-row INSERT,
+            # so we fill absent fields with None (missing -> NULL). COALESCE on
+            # conflict keeps existing values, so NULLs never overwrite good data.
+            payload = {field: non_empty.get(field) for field in _FIELDS}
             payload["match_key"] = person.match_key
             rows.append(payload)
 
