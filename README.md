@@ -86,6 +86,16 @@ consolidaciones (`hr_etl_consolidations_total`), fragmentos en buffer (`hr_etl_p
 y tiempos de procesado y persistencia (`hr_etl_processing_seconds`, `hr_etl_persist_seconds`).
 La velocidad (msg/s) se obtiene con `rate()` sobre los contadores.
 
+## Estrategia de matching
+
+Como los mensajes no tienen un ID único, cada fragmento se mapea a una clave de persona por prioridad:
+
+1. **passport** — clave más fiable (`passport:h85111106`)
+2. **nombre normalizado** — desde `fullname` o `name`+`last_name` (`name:wayne griffiths`)
+3. **dirección** — puente para fragmentos Net sin nombre ni pasaporte (`addr:471 samantha cliff`)
+
+Los fragmentos sin ninguna de estas claves se tratan como huérfanos y se descartan sin romper el pipeline. Los fragmentos de la misma clave se acumulan en Redis y se consolidan en un único registro `Person` cuando se alcanzan los fragmentos mínimos configurados (`CONSOLIDATION_MIN_FRAGMENTS`).
+
 ## Tests y calidad
 - `pytest` — 58 tests, cobertura de líneas 96% / ramas ~93%.
 - `sonar-project.properties` listo para SonarQube (usa `coverage.xml`).
