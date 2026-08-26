@@ -54,6 +54,8 @@ services:
       context: .
       dockerfile: docker/Dockerfile.app
     env_file: .env
+    extra_hosts:
+      - "localhost:host-gateway"
     depends_on:
       mongo:
         condition: service_healthy
