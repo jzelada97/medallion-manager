@@ -1,0 +1,18 @@
+# Local development / testing override.
+# Docker Compose applies this file automatically on top of docker-compose.yml when
+# running locally. It exposes the database ports to the host ONLY for development
+# and integration tests. Do NOT use this override in a shared/production deployment
+# (the base docker-compose.yml keeps DB ports internal by default, per security.md).
+
+services:
+  postgres:
+    ports:
+      - "5432:5432"
+
+  mongo:
+    ports:
+      - "27017:27017"
+
+  redis:
+    ports:
+      - "6379:6379"
