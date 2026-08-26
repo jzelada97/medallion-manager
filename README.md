@@ -70,8 +70,21 @@ resueltas. Los tests no requieren infra real (usan mongomock, fakeredis y SQLite
 
 - `GET /health` — estado.
 - `GET /metrics` — métricas Prometheus.
-- `GET /persons?limit=&offset=&city=&company=` — listado paginado de personas consolidadas.
-- `GET /persons/{id}` — detalle.
+- `GET /persons?limit=&offset=&q=&city=&company=&job=` — listado con búsqueda libre, filtros y paginación (`total`, `count`, `limit`, `offset`).
+- `GET /persons/{id}` — detalle (404 si no existe).
+- `GET /stats` — resumen: total de personas, top ciudades/empresas, cuántas tienen banco.
+
+## Monitorización (Prometheus)
+
+Prometheus (http://localhost:9090) scrapea:
+- La app ETL en `app:9100` (métricas del pipeline).
+- La API en `api:8000/metrics`.
+
+Métricas expuestas: mensajes consumidos por tipo (`hr_etl_messages_consumed_total`), fallidos
+(`hr_etl_messages_failed_total`), personas persistidas (`hr_etl_persons_persisted_total`),
+consolidaciones (`hr_etl_consolidations_total`), fragmentos en buffer (`hr_etl_pending_fragments`),
+y tiempos de procesado y persistencia (`hr_etl_processing_seconds`, `hr_etl_persist_seconds`).
+La velocidad (msg/s) se obtiene con `rate()` sobre los contadores.
 
 ## Tests y calidad
 - `pytest` — 58 tests, cobertura de líneas 96% / ramas ~93%.
