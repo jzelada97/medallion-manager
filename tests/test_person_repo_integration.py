@@ -100,3 +100,38 @@ def test_reprocessing_same_fragment_is_idempotent(pg_session_factory):
     repo.upsert(person)
 
     assert repo.count() == 1  # never duplicates
+
+
+def test_native_upsert_on_conflict(pg_session_factory):
+    """INSERT ... ON CONFLICT keeps existing data and only fills gaps (atomic)."""
+    repo = PersonRepository(pg_session_factory)
+    key = f"passport:{uuid.uuid4().hex[:8]}"
+
+    repo.upsert_native(Person(match_key=key, name="Ana", passport="X1"))
+    # second fragment: must NOT overwrite name, must fill iban
+    repo.upsert_native(Person(match_key=key, name="NO_WIN", iban="ES1", salary=1500.75))
+
+    assert repo.count() == 1
+    session = pg_session_factory()
+    try:
+        row = session.query(PersonRow).filter_by(match_key=key).one()
+        assert row.name == "Ana"       # preserved via COALESCE
+        assert row.iban == "ES1"       # filled
+        assert row.salary == 1500.75
+    finally:
+        session.close()
+
+
+def test_native_batch_upsert(pg_session_factory):
+    """Batch upsert persists many rows atomically in one statement."""
+    repo = PersonRepository(pg_session_factory)
+    prefix = uuid.uuid4().hex[:6]
+    people = [Person(match_key=f"passport:{prefix}-{i}", name=f"P{i}") for i in range(5)]
+
+    sent = repo.upsert_many_native(people)
+    assert sent == 5
+    assert repo.count() == 5
+
+    # reprocessing the same batch is idempotent (no duplicates)
+    repo.upsert_many_native(people)
+    assert repo.count() == 5
