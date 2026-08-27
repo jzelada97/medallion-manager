@@ -19,7 +19,7 @@ from hr_etl.warehouse.person_repo import PersonRepository, _non_empty_values
 
 def test_clean_salary_uncoercible_returns_none():
     # These survive the regex filter but are NOT valid floats -> ValueError branch.
-    assert clean_salary("1-2") is None    # "1-2" -> float() raises (except branch)
+    assert clean_salary("1-2") is None  # "1-2" -> float() raises (except branch)
     # These hit the sentinel guard (no except): still None
     assert clean_salary("-") is None
     assert clean_salary(".") is None
@@ -36,8 +36,8 @@ def test_person_filled_fields_and_merge():
 
     other = Person(match_key="k", name="NO_WIN", city="madrid")
     merged = p.merge(other)
-    assert merged.name == "Ana"      # existing kept
-    assert merged.city == "madrid"   # gap filled
+    assert merged.name == "Ana"  # existing kept
+    assert merged.city == "madrid"  # gap filled
 
 
 def test_non_empty_values_helper():

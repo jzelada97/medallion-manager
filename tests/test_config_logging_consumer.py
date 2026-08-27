@@ -9,8 +9,11 @@ from hr_etl.logging_conf import configure_logging, get_logger, mask_secret
 
 def test_settings_postgres_dsn():
     s = Settings(
-        postgres_user="u", postgres_password="p", postgres_host="h",
-        postgres_port=5432, postgres_db="db",
+        postgres_user="u",
+        postgres_password="p",
+        postgres_host="h",
+        postgres_port=5432,
+        postgres_db="db",
     )
     assert s.postgres_dsn == "postgresql+psycopg2://u:p@h:5432/db"
 
@@ -96,7 +99,11 @@ def test_consumer_consume_with_fake(monkeypatch):
 
     class FakeConsumer:
         def __init__(self):
-            self._msgs = [FakeMsg(b'{"Name":"Ana","Lastname":"Gil","Sex":"F","Telfnumber":"1","Passport":"X1","E-Mail":"a@b.c"}')]
+            self._msgs = [
+                FakeMsg(
+                    b'{"Name":"Ana","Lastname":"Gil","Sex":"F","Telfnumber":"1","Passport":"X1","E-Mail":"a@b.c"}'
+                )
+            ]
             self.committed = 0
             self.closed = False
 
@@ -117,7 +124,14 @@ def test_consumer_consume_with_fake(monkeypatch):
     consumer = KafkaMessageConsumer(settings, consumer=fake)
     out = list(consumer.consume(max_messages=1))
     assert out == [
-        {"Name": "Ana", "Lastname": "Gil", "Sex": "F", "Telfnumber": "1", "Passport": "X1", "E-Mail": "a@b.c"}
+        {
+            "Name": "Ana",
+            "Lastname": "Gil",
+            "Sex": "F",
+            "Telfnumber": "1",
+            "Passport": "X1",
+            "E-Mail": "a@b.c",
+        }
     ]
     assert fake.closed is True
 

@@ -42,13 +42,17 @@ class MongoLake:
             "kafka_offset": offset,
         }
 
-    def store_raw(self, message: dict[str, Any], fragment_type: str, offset: int | None = None) -> Any:
+    def store_raw(
+        self, message: dict[str, Any], fragment_type: str, offset: int | None = None
+    ) -> Any:
         """Insert a single raw message immediately. Returns the inserted id."""
         result = self._collection.insert_one(self._wrap(message, fragment_type, offset))
         logger.debug("raw message stored in lake type=%s offset=%s", fragment_type, offset)
         return result.inserted_id
 
-    def buffer_raw(self, message: dict[str, Any], fragment_type: str, offset: int | None = None) -> bool:
+    def buffer_raw(
+        self, message: dict[str, Any], fragment_type: str, offset: int | None = None
+    ) -> bool:
         """Queue a raw message for batch insertion.
 
         Returns True if a flush happened as a result (buffer full or interval

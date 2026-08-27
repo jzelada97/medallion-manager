@@ -47,9 +47,9 @@ def test_manual_flush_and_empty_flush(mongo_collection, personal_fragment):
     lake.buffer_raw(personal_fragment, "personal")
     lake.buffer_raw(personal_fragment, "personal")
     assert lake.count() == 0
-    assert lake.flush() == 2   # writes the 2 buffered
+    assert lake.flush() == 2  # writes the 2 buffered
     assert lake.count() == 2
-    assert lake.flush() == 0   # nothing left to flush
+    assert lake.flush() == 0  # nothing left to flush
 
 
 def test_ensure_indexes(mongo_collection):

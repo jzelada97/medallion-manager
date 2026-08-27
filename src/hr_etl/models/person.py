@@ -49,7 +49,5 @@ class Person(BaseModel):
     def filled_fields(self) -> int:
         """Count non-empty fields (excludes match_key)."""
         return sum(
-            1
-            for k, v in self.model_dump().items()
-            if k != "match_key" and v not in (None, "")
+            1 for k, v in self.model_dump().items() if k != "match_key" and v not in (None, "")
         )

@@ -98,11 +98,14 @@ class Pipeline:
             if count < self._min_fragments:
                 return None
 
-            fragments = [(f["message"], FragmentType(f["type"])) for f in self._buffer.get_fragments(key)]
+            fragments = [
+                (f["message"], FragmentType(f["type"])) for f in self._buffer.get_fragments(key)
+            ]
             person = consolidate(fragments)
             if person is None:
                 return None
             CONSOLIDATIONS.inc()
+            self._buffer.clear(key)
 
             with PERSIST_SECONDS.time():
                 person_id = self._repo.upsert(person)

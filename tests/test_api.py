@@ -87,8 +87,8 @@ def test_pagination_total_vs_page(sqlite_session_factory):
 
     resp = client.get("/persons", params={"limit": 2, "offset": 0})
     body = resp.json()
-    assert body["total"] == 5     # total across all matches
-    assert body["count"] == 2     # only this page
+    assert body["total"] == 5  # total across all matches
+    assert body["count"] == 2  # only this page
     assert body["limit"] == 2
     assert body["offset"] == 0
 

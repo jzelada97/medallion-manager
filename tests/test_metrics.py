@@ -39,8 +39,8 @@ def test_consumed_and_persisted_metrics_increase(
     persisted_before = _counter_value(PERSONS_PERSISTED)
     consolidations_before = _counter_value(CONSOLIDATIONS)
 
-    pipe.process_message(personal_fragment)   # 1st fragment, buffered
-    pipe.process_message(bank_fragment)        # 2nd -> consolidate + persist
+    pipe.process_message(personal_fragment)  # 1st fragment, buffered
+    pipe.process_message(bank_fragment)  # 2nd -> consolidate + persist
 
     assert _counter_value(MESSAGES_CONSUMED, fragment_type="personal") == consumed_before + 1
     assert _counter_value(PERSONS_PERSISTED) == persisted_before + 1

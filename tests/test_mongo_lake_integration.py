@@ -66,10 +66,10 @@ def test_store_raw_persists_verbatim_with_metadata(lake_collection):
     assert lake.count() == 1
 
     doc = lake_collection.find_one({"_id": inserted_id})
-    assert doc["payload"] == message          # stored exactly as received
+    assert doc["payload"] == message  # stored exactly as received
     assert doc["fragment_type"] == "personal"
     assert doc["kafka_offset"] == 7
-    assert "ingested_at" in doc               # metadata added
+    assert "ingested_at" in doc  # metadata added
 
 
 def test_store_multiple_fragments(lake_collection):

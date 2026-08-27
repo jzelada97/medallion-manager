@@ -49,7 +49,9 @@ class KafkaMessageConsumer:
             logger.warning("failed to decode kafka message")
             return None
 
-    def consume(self, max_messages: int | None = None, timeout: float = 1.0) -> Iterator[dict[str, Any]]:
+    def consume(
+        self, max_messages: int | None = None, timeout: float = 1.0
+    ) -> Iterator[dict[str, Any]]:
         """Yield decoded messages. Commits offsets after yielding.
 
         `max_messages` bounds the loop (useful for tests/demos); None runs forever.

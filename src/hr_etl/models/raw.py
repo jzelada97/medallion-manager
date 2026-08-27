@@ -27,7 +27,9 @@ class FragmentType(str, Enum):
 # Distinguishing keys per schema (as documented in the server README).
 # Detection is based on the set of keys present in the message.
 _SCHEMA_KEYS: dict[FragmentType, frozenset[str]] = {
-    FragmentType.PERSONAL: frozenset({"name", "lastname", "sex", "telfnumber", "passport", "email"}),
+    FragmentType.PERSONAL: frozenset(
+        {"name", "lastname", "sex", "telfnumber", "passport", "email"}
+    ),
     FragmentType.LOCATION: frozenset({"fullname", "city", "address"}),
     FragmentType.PROFESSIONAL: frozenset(
         {"fullname", "company", "companyaddress", "companytelfnumber", "companyemail", "job"}

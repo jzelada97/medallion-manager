@@ -56,7 +56,9 @@ col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("Top ciudades")
     if top_cities:
-        df_cities = pd.DataFrame(top_cities).rename(columns={"value": "ciudad", "count": "personas"})
+        df_cities = pd.DataFrame(top_cities).rename(
+            columns={"value": "ciudad", "count": "personas"}
+        )
         st.bar_chart(df_cities.set_index("ciudad"))
     else:
         st.info("Sin datos todavía.")
@@ -64,7 +66,9 @@ with col_b:
     st.subheader("Top empresas")
     top_companies = stats.get("top_companies", [])
     if top_companies:
-        df_comp = pd.DataFrame(top_companies).rename(columns={"value": "empresa", "count": "personas"})
+        df_comp = pd.DataFrame(top_companies).rename(
+            columns={"value": "empresa", "count": "personas"}
+        )
         st.bar_chart(df_comp.set_index("empresa"))
     else:
         st.info("Sin datos todavía.")
@@ -114,5 +118,7 @@ if items:
         if detail:
             st.json(detail)
 else:
-    st.info("No hay personas que coincidan con la búsqueda. "
-            "Si el pipeline aún no ha procesado datos, la tabla estará vacía.")
+    st.info(
+        "No hay personas que coincidan con la búsqueda. "
+        "Si el pipeline aún no ha procesado datos, la tabla estará vacía."
+    )

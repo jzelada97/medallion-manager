@@ -15,9 +15,23 @@ from hr_etl.models.person import Person
 logger = get_logger(__name__)
 
 _FIELDS = (
-    "passport", "full_name", "name", "lastname", "sex", "phone", "email",
-    "city", "address", "company", "company_address", "company_phone",
-    "company_email", "job", "iban", "salary", "ipv4",
+    "passport",
+    "full_name",
+    "name",
+    "lastname",
+    "sex",
+    "phone",
+    "email",
+    "city",
+    "address",
+    "company",
+    "company_address",
+    "company_phone",
+    "company_email",
+    "job",
+    "iban",
+    "salary",
+    "ipv4",
 )
 
 

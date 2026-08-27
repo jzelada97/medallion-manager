@@ -471,7 +471,7 @@ histogram_quantile(0.99, rate(hr_etl_processing_seconds_bucket[5m]))
 ## Tests y calidad
 
 - **Framework**: pytest con pytest-cov
-- **Cobertura**: 79 tests, ~94% lineas, ~90% ramas
+- **Cobertura**: 79 tests, 91% lineas
 - **Umbrales**: lineas >= 80%, ramas >= 75%, funciones >= 85%
 - **Sin infra real**: tests unitarios usan mongomock, fakeredis y SQLite
 - **Con infra**: tests de integracion marcados `@pytest.mark.integration` (se saltan si no hay BD disponible)

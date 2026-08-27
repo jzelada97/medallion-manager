@@ -54,7 +54,9 @@ def test_consolidate_skips_orphan_but_keeps_valid(personal_fragment):
 
 
 def test_fragment_to_person_net_and_professional():
-    net = fragment_to_person({"Address": "Calle 1", "IPv4": "1.2.3.4"}, FragmentType.NET, "addr:calle 1")
+    net = fragment_to_person(
+        {"Address": "Calle 1", "IPv4": "1.2.3.4"}, FragmentType.NET, "addr:calle 1"
+    )
     assert net.ipv4 == "1.2.3.4"
     prof = fragment_to_person(
         {"Fullname": "Ana Gil", "Company": "ACME", "Job": "Eng"},

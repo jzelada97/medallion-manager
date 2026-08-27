@@ -62,7 +62,7 @@ def build_router(session_factory) -> APIRouter:
         try:
             filters = []
             if city:
-                filters.append(PersonRow.city == city.strip().lower())
+                filters.append(PersonRow.city.ilike(f"%{city.strip()}%"))
             if company:
                 filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
             if job:
@@ -86,9 +86,11 @@ def build_router(session_factory) -> APIRouter:
                 count_stmt = count_stmt.where(f)
 
             total = session.execute(count_stmt).scalar_one()
-            rows = session.execute(
-                base.order_by(PersonRow.id).limit(limit).offset(offset)
-            ).scalars().all()
+            rows = (
+                session.execute(base.order_by(PersonRow.id).limit(limit).offset(offset))
+                .scalars()
+                .all()
+            )
 
             return {
                 "total": total,

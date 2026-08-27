@@ -52,7 +52,9 @@ def _postgres_available() -> bool:
 
 pytestmark = [
     pytest.mark.integration,
-    pytest.mark.skipif(not _postgres_available(), reason="no PostgreSQL reachable at TEST_POSTGRES_DSN"),
+    pytest.mark.skipif(
+        not _postgres_available(), reason="no PostgreSQL reachable at TEST_POSTGRES_DSN"
+    ),
 ]
 
 
@@ -85,9 +87,9 @@ def test_insert_and_idempotent_upsert_on_real_postgres(pg_session_factory):
     session = pg_session_factory()
     try:
         row = session.query(PersonRow).filter_by(match_key=key).one()
-        assert row.name == "Ana"        # preserved
-        assert row.iban == "ES1"        # filled
-        assert row.salary == 1500.75    # filled
+        assert row.name == "Ana"  # preserved
+        assert row.iban == "ES1"  # filled
+        assert row.salary == 1500.75  # filled
     finally:
         session.close()
 
@@ -117,8 +119,8 @@ def test_native_upsert_on_conflict(pg_session_factory):
     session = pg_session_factory()
     try:
         row = session.query(PersonRow).filter_by(match_key=key).one()
-        assert row.name == "Ana"       # preserved via COALESCE
-        assert row.iban == "ES1"       # filled
+        assert row.name == "Ana"  # preserved via COALESCE
+        assert row.iban == "ES1"  # filled
         assert row.salary == 1500.75
     finally:
         session.close()
