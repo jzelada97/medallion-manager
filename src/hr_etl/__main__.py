@@ -43,10 +43,15 @@ def main() -> None:
     )
     buffer = RedisBuffer(redis_client, ttl=settings.redis_buffer_ttl)
 
-    # Warehouse (Postgres)
+    # Warehouse (Postgres) — Silver layer
     engine = create_db_engine(settings.postgres_dsn)
     init_schema(engine)
     repo = PersonRepository(make_session_factory(engine))
+
+    # Gold layer (aggregates/views for fast querying)
+    from hr_etl.warehouse.gold_layer import init_gold_schema
+
+    init_gold_schema(engine)
 
     pipeline = Pipeline(lake, buffer, repo, min_fragments=settings.consolidation_min_fragments)
     consumer = KafkaMessageConsumer(settings)

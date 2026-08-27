@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 
 from hr_etl.models.db_models import MatchCandidate, PersonRow
 
@@ -174,6 +174,46 @@ def build_router(session_factory) -> APIRouter:
                     }
                     for r in rows
                 ],
+            }
+        finally:
+            session.close()
+
+    @router.get("/gold/stats")
+    def gold_stats() -> dict:
+        """Pre-computed Gold layer statistics (faster than live aggregation)."""
+        session = session_factory()
+        try:
+            row = session.execute(
+                text("SELECT * FROM gold_stats WHERE id = 1")
+            ).fetchone()
+            if row is None:
+                return {"error": "gold layer not refreshed yet"}
+            return {
+                "total_persons": row.total_persons,
+                "with_passport": row.with_passport,
+                "with_city": row.with_city,
+                "with_company": row.with_company,
+                "with_bank": row.with_bank,
+                "with_ipv4": row.with_ipv4,
+                "cross_linked": row.cross_linked,
+                "avg_completeness": round(row.avg_completeness, 2),
+            }
+        finally:
+            session.close()
+
+    @router.get("/gold/completeness")
+    def gold_completeness() -> dict:
+        """Distribution of field completeness across persons (Gold layer)."""
+        session = session_factory()
+        try:
+            rows = session.execute(
+                text("SELECT fields_filled, person_count FROM gold_completeness ORDER BY fields_filled")
+            ).fetchall()
+            return {
+                "distribution": [
+                    {"fields_filled": r.fields_filled, "count": r.person_count}
+                    for r in rows
+                ]
             }
         finally:
             session.close()
