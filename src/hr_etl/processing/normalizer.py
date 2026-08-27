@@ -16,17 +16,25 @@ _WS_RE = re.compile(r"\s+")
 # Titles/honorifics that appear as prefixes in fullnames from the generator.
 # These are stripped before matching to allow cross-linking between Personal
 # (which has no title) and Location/Professional (which may include one).
-_TITLE_RE = re.compile(
+_TITLE_PREFIX_RE = re.compile(
     r"^(mr\.?|mrs\.?|ms\.?|dr\.?|dr\(a\)\.?|dott\.?|dott\.ssa|"
     r"ing\.?|lic\.?|mtro\.?|prof\.?|"
     r"sr\.?|sra\.?|sr\(a\)\.?|sig\.?|sig\.ra)\s+",
     re.IGNORECASE,
 )
 
+# Suffixes (professional/generational) that appear AFTER the name.
+_TITLE_SUFFIX_RE = re.compile(
+    r"\s+(md|phd|ph\.d\.?|jr\.?|sr\.?|ii|iii|iv|pi|dds|esq\.?)$",
+    re.IGNORECASE,
+)
+
 
 def strip_titles(text: str) -> str:
-    """Remove honorific/professional title prefixes from a name."""
-    return _TITLE_RE.sub("", text).strip()
+    """Remove honorific/professional title prefixes and suffixes from a name."""
+    result = _TITLE_PREFIX_RE.sub("", text).strip()
+    result = _TITLE_SUFFIX_RE.sub("", result).strip()
+    return result
 
 
 def strip_accents(text: str) -> str:

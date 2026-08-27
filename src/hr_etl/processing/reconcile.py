@@ -9,7 +9,7 @@ Run: python -m hr_etl.processing.reconcile
 
 from __future__ import annotations
 
-from sqlalchemy import select, func, and_, delete
+from sqlalchemy import select, func, delete
 from sqlalchemy.orm import Session
 
 from hr_etl.logging_conf import get_logger
@@ -27,50 +27,59 @@ def _normalize_name(raw: str | None) -> str:
 
 
 def find_candidates(session: Session, min_confidence: float = 0.5) -> list[MatchCandidate]:
-    """Find probable duplicate pairs between passport-based and name-based records.
+    """Find probable duplicate pairs in the warehouse.
 
-    Strategy:
-    - For each name-based record, check if any passport record has a full_name
-      that is a prefix of it (after normalization).
-    - Assign confidence based on how much of the name overlaps.
+    Strategies:
+    1. Passport-based records whose name is a prefix of a name-based record.
+    2. Name-based records whose names are prefixes of each other.
+
+    This covers cases where the same person has fragments under different keys
+    due to name inconsistencies (extra surnames, titles that weren't stripped, etc.)
     """
-    # Get all passport-based persons with a name
-    passport_persons = (
+    # Get all persons with a usable name, grouped by key type
+    all_persons = (
         session.execute(
-            select(PersonRow).where(
-                and_(
-                    PersonRow.match_key.like("passport:%"),
-                    PersonRow.full_name.isnot(None),
-                )
-            )
+            select(PersonRow).where(PersonRow.full_name.isnot(None))
         )
         .scalars()
         .all()
     )
 
-    # Build lookup: normalized name -> passport person (for prefix search)
+    passport_persons = [p for p in all_persons if p.match_key.startswith("passport:")]
+    name_persons = [p for p in all_persons if p.match_key.startswith("name:")]
+
+    # Build lookup: normalized name -> person (for passport records)
     passport_by_name: dict[str, PersonRow] = {}
     for pp in passport_persons:
         norm = _normalize_name(pp.full_name)
         if norm and len(norm) >= 3:
             passport_by_name[norm] = pp
 
-    # Get all name-based persons
-    name_persons = (
-        session.execute(select(PersonRow).where(PersonRow.match_key.like("name:%")))
-        .scalars()
-        .all()
-    )
+    # Build lookup: normalized name -> person (for name records)
+    name_by_name: dict[str, PersonRow] = {}
+    for np in name_persons:
+        norm = _normalize_name(np.full_name)
+        if norm and len(norm) >= 3:
+            name_by_name[norm] = np
 
     candidates: list[MatchCandidate] = []
+    seen_pairs: set[tuple[int, int]] = set()
 
-    for np in name_persons:
-        np_name = _normalize_name(np.full_name)
-        if not np_name or len(np_name) < 3:
-            continue
+    def _add_candidate(a: PersonRow, b: PersonRow, confidence: float, reason: str) -> None:
+        pair = (min(a.id, b.id), max(a.id, b.id))
+        if pair not in seen_pairs:
+            seen_pairs.add(pair)
+            candidates.append(
+                MatchCandidate(
+                    person_id_a=pair[0],
+                    person_id_b=pair[1],
+                    confidence=confidence,
+                    reason=reason,
+                )
+            )
 
-        # Check if any passport name is a prefix of this name-based record
-        # Use first 2 words as lookup key for efficiency
+    # Strategy 1: name-based record whose name starts with a passport record's name
+    for np_name, np in name_by_name.items():
         words = np_name.split()
         for length in range(min(len(words), 3), 0, -1):
             prefix = " ".join(words[:length])
@@ -78,15 +87,23 @@ def find_candidates(session: Session, min_confidence: float = 0.5) -> list[Match
             if pp and prefix != np_name:
                 confidence = round(len(prefix) / len(np_name), 3)
                 if confidence >= min_confidence:
-                    candidates.append(
-                        MatchCandidate(
-                            person_id_a=pp.id,
-                            person_id_b=np.id,
-                            confidence=confidence,
-                            reason=f"name_prefix: '{prefix}' -> '{np_name}'",
-                        )
+                    _add_candidate(pp, np, confidence, f"passport_prefix: '{prefix}' -> '{np_name}'")
+                break
+
+    # Strategy 2: name-based records that are prefixes of each other
+    sorted_names = sorted(name_by_name.keys())
+    for i, name_a in enumerate(sorted_names):
+        for j in range(i + 1, min(i + 20, len(sorted_names))):  # limit scan window
+            name_b = sorted_names[j]
+            if name_b.startswith(name_a) and name_a != name_b:
+                confidence = round(len(name_a) / len(name_b), 3)
+                if confidence >= min_confidence:
+                    _add_candidate(
+                        name_by_name[name_a],
+                        name_by_name[name_b],
+                        confidence,
+                        f"name_prefix: '{name_a}' -> '{name_b}'",
                     )
-                break  # found best match, stop
 
     return candidates
 

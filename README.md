@@ -265,8 +265,10 @@ Antes de comparar, todo pasa por:
 - Strip accents (NFKD decomposition)
 - Collapse whitespace
 - Strip bordes
+- **Strip titles/honorifics** — prefijos: Mr, Mrs, Dr, Dr(a)., Ing., Lic., Mtro., Sr(a)., Dott., Sig., Prof.
+- **Strip suffixes** — sufijos profesionales/generacionales: MD, PhD, Jr., Sr., II, III, Pi
 
-Ejemplo: `"  José  García "` -> `"jose garcia"`
+Ejemplo: `"Dr(a). José  García MD"` -> `"jose garcia"`
 
 ### Normalizacion de keys
 
@@ -290,6 +292,47 @@ ser personas distintas. Estos registros quedan como entradas separadas en el war
 Detalle menor: algunos nombres del generador contienen dobles espacios (ej: `"Uma  Gimenez Suarez"`).
 Se guardan tal cual en el warehouse; la normalizacion de keys los colapsa para el matching pero el
 valor persistido conserva el original.
+
+### Batch Reconciliation (match_candidates)
+
+Para abordar los casos ambiguos donde el matching en streaming no puede decidir, implementamos un
+**job batch de reconciliacion** que analiza el warehouse y detecta pares de registros que
+*probablemente* son la misma persona:
+
+- **Tabla `match_candidates`**: almacena pares (person_id_a, person_id_b) con un score de confianza
+  (0.0 a 1.0) y la razon del match hipotetico.
+- **Estrategias de deteccion**:
+  1. Registros con passport cuyo nombre es prefijo de un registro por nombre (ej: "octavio ponce" -> "octavio ponce gimenez")
+  2. Registros por nombre que son prefijos entre si
+- **Confianza** = longitud_prefijo / longitud_total. A mayor cobertura, mas probable que sea la misma persona.
+- **Nunca se auto-mergean** — quedan como candidatos para revision humana o un threshold de confianza.
+
+Ejecucion: `python -m hr_etl.processing.reconcile`
+API: `GET /candidates?min_confidence=0.8`
+
+Ejemplo de resultado:
+```
+crystal cunningham (passport:445725093) <-> Crystal Cunningham MD  | confianza: 0.86
+octavio ponce (passport:140749868)      <-> Octavio Ponce Gimenez  | confianza: 0.74
+```
+
+### Analisis de los datos del generador (hallazgos)
+
+Tras analizar ~500k mensajes del generador, documentamos estos patrones:
+
+| Aspecto | Hallazgo |
+|---------|----------|
+| Distribucion de tipos | ~20% cada uno (Personal, Location, Professional, Bank, Net) balanceado |
+| Fragmentos unknown | 0% — el detector identifica el 100% |
+| Location.fullname vs Professional.fullname | Siempre identicos para la misma persona |
+| Personal.email vs Professional.companyemail | Nunca coinciden (generados independientemente) |
+| Personal.telfnumber vs Professional.companytelfnumber | Nunca coinciden |
+| Location.address vs Net.address | Siempre identicos (100% match exacto) |
+| Titulos en fullname | ~10% tienen prefijos (Dr, Mr, Ing, etc.) o sufijos (MD, Pi) |
+| Apellidos extra | ~30% de Location tiene mas apellidos que Personal (tercer apellido) |
+| Timing entre fragmentos | <1 segundo entre fragmentos de la misma persona |
+| Salarios | Rango 30k-200k, sin negativos ni absurdos |
+| Emails/IBAN/IPv4 | Todos con formato valido, sin basura |
 
 ---
 
