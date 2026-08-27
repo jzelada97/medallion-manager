@@ -7,7 +7,7 @@ from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import func, or_, select
 
-from hr_etl.models.db_models import PersonRow
+from hr_etl.models.db_models import MatchCandidate, PersonRow
 
 
 def _row_to_dict(row: PersonRow) -> dict:
@@ -137,6 +137,43 @@ def build_router(session_factory) -> APIRouter:
                 "with_bank": session.execute(
                     select(func.count()).select_from(PersonRow).where(PersonRow.iban.isnot(None))
                 ).scalar_one(),
+            }
+        finally:
+            session.close()
+
+    @router.get("/candidates")
+    def list_candidates(
+        limit: int = Query(50, ge=1, le=500),
+        min_confidence: float = Query(0.5, ge=0.0, le=1.0),
+    ) -> dict:
+        """List probable duplicate candidates detected by batch reconciliation."""
+        session = session_factory()
+        try:
+            stmt = (
+                select(MatchCandidate)
+                .where(MatchCandidate.confidence >= min_confidence)
+                .order_by(MatchCandidate.confidence.desc())
+                .limit(limit)
+            )
+            rows = session.execute(stmt).scalars().all()
+            total = session.execute(
+                select(func.count())
+                .select_from(MatchCandidate)
+                .where(MatchCandidate.confidence >= min_confidence)
+            ).scalar_one()
+            return {
+                "total": total,
+                "count": len(rows),
+                "items": [
+                    {
+                        "id": r.id,
+                        "person_id_a": r.person_id_a,
+                        "person_id_b": r.person_id_b,
+                        "confidence": r.confidence,
+                        "reason": r.reason,
+                    }
+                    for r in rows
+                ],
             }
         finally:
             session.close()

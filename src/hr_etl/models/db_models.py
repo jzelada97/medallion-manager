@@ -42,3 +42,21 @@ class PersonRow(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class MatchCandidate(Base):
+    """Possible duplicate pair detected by batch reconciliation.
+
+    Stores pairs of person records that *might* be the same individual,
+    along with a confidence score and the reason for the match hypothesis.
+    These are NOT confirmed merges — they require review or a higher-confidence pass.
+    """
+
+    __tablename__ = "match_candidates"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    person_id_a: Mapped[int] = mapped_column(index=True)
+    person_id_b: Mapped[int] = mapped_column(index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reason: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
