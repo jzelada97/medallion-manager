@@ -2,6 +2,11 @@
 
 Flow per message: decode -> detect type -> store raw in lake (Mongo) -> buffer in
 Redis by person key -> when enough fragments, consolidate -> upsert in warehouse.
+
+Cross-linking: when a Personal fragment has both passport and a name, we register
+an alias (name -> passport key) in Redis. Later, when a Location/Professional
+arrives with a name-based key, we resolve the alias and redirect the fragment
+to the passport-based key, achieving the cross-join.
 """
 
 from __future__ import annotations
@@ -23,7 +28,8 @@ from hr_etl.metrics.prometheus import (
 from hr_etl.models.raw import FragmentType
 from hr_etl.processing.consolidator import consolidate
 from hr_etl.processing.detector import detect_type
-from hr_etl.processing.matcher import match_key
+from hr_etl.processing.matcher import build_full_name, match_key
+from hr_etl.processing.normalizer import normalize_message
 from hr_etl.warehouse.person_repo import PersonRepository
 
 logger = get_logger(__name__)
@@ -44,6 +50,25 @@ class Pipeline:
         self._repo = repo
         self._min_fragments = min_fragments
 
+    def _register_cross_link(self, message: dict[str, Any], ftype: FragmentType, key: str) -> None:
+        """If a Personal fragment has passport + name, register the name as alias."""
+        if ftype != FragmentType.PERSONAL or not key.startswith("passport:"):
+            return
+        norm = normalize_message(message)
+        name = build_full_name(norm)
+        if name:
+            self._buffer.register_alias(name, key)
+
+    def _resolve_cross_link(self, key: str) -> str:
+        """Try to resolve a name-based key to a passport-based key via alias."""
+        if not key.startswith("name:"):
+            return key
+        resolved = self._buffer.resolve_alias(key)
+        if resolved:
+            logger.debug("cross-link resolved: %s -> %s", key, resolved)
+            return resolved
+        return key
+
     @PROCESSING_SECONDS.time()
     def process_message(self, message: dict[str, Any], offset: int | None = None) -> int | None:
         """Process one raw message. Returns the persisted person id if consolidated."""
@@ -63,6 +88,11 @@ class Pipeline:
                 logger.warning("fragment has no matching key; kept raw only")
                 return None
 
+            # Cross-linking: register alias if Personal, resolve if name-based
+            self._register_cross_link(message, ftype, key)
+            key = self._resolve_cross_link(key)
+
+            logger.debug("fragment type=%s key=%s", ftype.value, key)
             count = self._buffer.add_fragment(key, message, ftype.value)
             PENDING_FRAGMENTS.set(count)
             if count < self._min_fragments:

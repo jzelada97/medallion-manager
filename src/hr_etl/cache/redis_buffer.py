@@ -2,6 +2,10 @@
 
 Fragments of the same person do not arrive together, so we accumulate them under
 their matching key (with a TTL) and consolidate once enough fragments are present.
+
+Cross-linking: when a fragment with a passport also carries a name, we register
+a name->passport alias so that later fragments (Location/Professional) that only
+have a fullname can be redirected to the correct passport-based key.
 """
 
 from __future__ import annotations
@@ -21,9 +25,51 @@ class RedisBuffer:
         self._client = client
         self._ttl = ttl
         self._prefix = prefix
+        self._alias_prefix = "alias"
 
     def _redis_key(self, match_key: str) -> str:
         return f"{self._prefix}:{match_key}"
+
+    def _alias_key(self, name: str) -> str:
+        return f"{self._alias_prefix}:{name}"
+
+    # ------------------------------------------------------------------
+    # Alias management (cross-linking passport <-> name)
+    # ------------------------------------------------------------------
+
+    def register_alias(self, name: str, canonical_key: str) -> None:
+        """Register a name as alias for a passport-based canonical key.
+
+        Called when a Personal fragment has both passport and name.
+        """
+        if not name or not canonical_key:
+            return
+        akey = self._alias_key(name)
+        self._client.set(akey, canonical_key, ex=self._ttl * 3)  # longer TTL for aliases
+        logger.debug("alias registered: %s -> %s", name, canonical_key)
+
+    def resolve_alias(self, name_key: str) -> str | None:
+        """Try to resolve a name-based match_key to a passport-based one.
+
+        Only resolves on EXACT name match to avoid false positives
+        (e.g. 'octavio ponce' and 'octavio ponce gimenez' could be different people).
+        Returns the canonical passport key if found, None otherwise.
+        """
+        if not name_key.startswith("name:"):
+            return None
+        name = name_key[5:]  # strip "name:" prefix
+
+        # Exact lookup only — no prefix/fuzzy matching to avoid false merges
+        akey = self._alias_key(name)
+        result = self._client.get(akey)
+        if result:
+            return result if isinstance(result, str) else result.decode("utf-8")
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Fragment buffering
+    # ------------------------------------------------------------------
 
     def add_fragment(self, match_key: str, message: dict[str, Any], fragment_type: str) -> int:
         """Append a fragment for a person key. Returns current fragment count."""
