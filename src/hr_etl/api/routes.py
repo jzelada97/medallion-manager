@@ -62,7 +62,7 @@ def build_router(session_factory) -> APIRouter:
         try:
             filters = []
             if city:
-                filters.append(PersonRow.city.ilike(f"%{city.strip()}%"))
+                filters.append(func.lower(PersonRow.city) == city.strip().lower())
             if company:
                 filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
             if job:
