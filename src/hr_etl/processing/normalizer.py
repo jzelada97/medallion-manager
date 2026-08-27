@@ -28,13 +28,20 @@ def normalize_text(value: Any) -> str:
     return _WS_RE.sub(" ", text)
 
 
+_KEY_ALIASES: dict[str, str] = {
+    "companyadress": "companyaddress",  # README typo: "Company Adress" -> canonical
+}
+
+
 def normalize_key(key: str) -> str:
     """Normalize a raw message key: lowercase, remove spaces/underscores/hyphens.
 
     Maps variants like 'E-Mail', 'Company Address', 'company_email' to canonical
     lowercase alphanumeric keys ('email', 'companyaddress', 'companyemail').
+    Also resolves known typos (e.g. 'Company Adress' -> 'companyaddress').
     """
-    return re.sub(r"[\s_\-]+", "", str(key).strip().lower())
+    normalized = re.sub(r"[\s_\-]+", "", str(key).strip().lower())
+    return _KEY_ALIASES.get(normalized, normalized)
 
 
 def normalize_message(message: dict[str, Any]) -> dict[str, Any]:

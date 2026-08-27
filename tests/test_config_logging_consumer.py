@@ -120,3 +120,69 @@ def test_consumer_consume_with_fake(monkeypatch):
         {"Name": "Ana", "Lastname": "Gil", "Sex": "F", "Telfnumber": "1", "Passport": "X1", "E-Mail": "a@b.c"}
     ]
     assert fake.closed is True
+
+
+def test_pii_masking_filter_passport(capfd):
+    """The PII filter masks passport values in log output."""
+    import logging
+    import sys
+
+    from hr_etl.logging_conf import PIIMaskingFilter
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(PIIMaskingFilter())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    test_logger = logging.getLogger("test.pii.passport")
+    test_logger.handlers = [handler]
+    test_logger.setLevel(logging.DEBUG)
+    test_logger.propagate = False
+
+    test_logger.info("fragment key=passport=%s", "H85111106")
+    captured = capfd.readouterr()
+    assert "H85111106" not in captured.out
+    assert "***masked***" in captured.out
+
+
+def test_pii_masking_filter_iban(capfd):
+    """The PII filter masks IBAN values in log output."""
+    import logging
+    import sys
+
+    from hr_etl.logging_conf import PIIMaskingFilter
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(PIIMaskingFilter())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    test_logger = logging.getLogger("test.pii.iban")
+    test_logger.handlers = [handler]
+    test_logger.setLevel(logging.DEBUG)
+    test_logger.propagate = False
+
+    test_logger.info("person iban=ES9121000418450200051332")
+    captured = capfd.readouterr()
+    assert "ES9121000418450200051332" not in captured.out
+    assert "ES91***masked***" in captured.out
+
+
+def test_pii_masking_filter_email(capfd):
+    """The PII filter masks email addresses in log output."""
+    import logging
+    import sys
+
+    from hr_etl.logging_conf import PIIMaskingFilter
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.addFilter(PIIMaskingFilter())
+    handler.setFormatter(logging.Formatter("%(message)s"))
+
+    test_logger = logging.getLogger("test.pii.email")
+    test_logger.handlers = [handler]
+    test_logger.setLevel(logging.DEBUG)
+    test_logger.propagate = False
+
+    test_logger.info("contact email=john.doe@example.com found")
+    captured = capfd.readouterr()
+    assert "john.doe" not in captured.out
+    assert "***@masked***" in captured.out

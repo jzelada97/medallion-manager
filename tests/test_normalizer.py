@@ -57,3 +57,8 @@ def test_normalize_message_keys():
 )
 def test_clean_salary(value, expected):
     assert clean_salary(value) == expected
+
+
+def test_normalize_key_typo_alias():
+    """'Company Adress' (single d, as in generator README) resolves to canonical key."""
+    assert normalize_key("Company Adress") == "companyaddress"

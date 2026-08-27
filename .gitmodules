@@ -1,0 +1,3 @@
+[submodule "data-generator"]
+	path = data-generator
+	url = https://github.com/Factoria-F5-madrid/data-engineering-educational-project.git
