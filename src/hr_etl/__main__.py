@@ -51,9 +51,16 @@ def main() -> None:
     pipeline = Pipeline(lake, buffer, repo, min_fragments=settings.consolidation_min_fragments)
     consumer = KafkaMessageConsumer(settings)
 
-    logger.info("HR ETL started; consuming topic=%s", settings.kafka_topic)
-    for message in consumer.consume():
-        pipeline.process_message(message)
+    logger.info("HR ETL started; consuming topic=%s max_records=%s", settings.kafka_topic, settings.max_records)
+    try:
+        for message in consumer.consume(max_messages=settings.max_records):
+            pipeline.process_message(message)
+        if settings.max_records:
+            logger.info("max_records=%d reached, stopping cleanly", settings.max_records)
+    finally:
+        mongo.close()
+        engine.dispose()
+        logger.info("connections closed cleanly")
 
 
 if __name__ == "__main__":

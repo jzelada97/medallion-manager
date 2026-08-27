@@ -31,6 +31,9 @@ ROADMAP.local.md
 .DS_Store
 Thumbs.db
 
+# Documentación personal local
+docs/
+
 # Data dumps (nunca subir datos)
 data/
 dumps/
