@@ -7,8 +7,9 @@ Incluye cache **Redis** para buffering intermedio, metricas **Prometheus**, **AP
 consulta (FastAPI) y **frontend** interactivo (Streamlit). Todo dockerizado y orquestado con
 Docker Compose.
 
-> **Regla del reto**: el codigo del generador de datos NO se lee ni se inspecciona. Solo se
-> ejecuta con `docker-compose up --build`. Este repositorio nunca accede a esa logica.
+> **Nota sobre el generador**: la lógica de limpieza/matching se diseñó de forma
+> independiente del generador de datos (no se basa en inspeccionar cómo genera los datos).
+> Cerrada esa fase, el generador puede incluirse/desplegarse si hace falta para la demo.
 
 ---
 
@@ -612,3 +613,25 @@ completo. Las principales:
 ## Licencia
 
 Proyecto educativo del Bootcamp de Ingenieria de Datos (Factoria F5 Madrid).
+
+---
+
+## CI/CD y despliegue
+
+### Integración continua (GitHub Actions)
+
+En cada push/PR a `main` o `dev` se ejecuta `.github/workflows/ci.yml`:
+
+- **Job `unit`**: levanta Postgres/Mongo/Redis como *service containers*, instala el
+  paquete con extras `dev,frontend`, y corre `ruff`, `black --check` y `pytest` con
+  cobertura (los 112 tests). Sube `coverage.xml` como artefacto.
+- **Job `airflow`**: levanta el stack de Airflow y ejecuta los tests del sensor
+  deferrable dentro del contenedor (`scripts/run-airflow-tests.sh`).
+
+### Despliegue
+
+Pensado para una **VM del Always Free de Oracle Cloud**: overlay de producción
+`docker-compose.prod.yml` + `deploy/Caddyfile` (HTTPS automático con Caddy, bases de
+datos no expuestas al exterior) y script de arranque `deploy/setup-oracle-vm.sh`.
+Para practicar el flujo de OCI antes del stack completo hay un ensayo mínimo en
+[`deploy/oracle-hello/`](deploy/oracle-hello/README.md).

@@ -67,7 +67,9 @@ SELECT
     COUNT(iban),
     COUNT(ipv4),
     COUNT(CASE WHEN passport IS NOT NULL AND city IS NOT NULL THEN 1 END),
-    AVG(
+    -- COALESCE guards the empty-table case: AVG over zero rows returns NULL, but
+    -- gold_stats.avg_completeness is NOT NULL. With no persons, completeness is 0.
+    COALESCE(AVG(
         (CASE WHEN passport IS NOT NULL THEN 1 ELSE 0 END) +
         (CASE WHEN full_name IS NOT NULL THEN 1 ELSE 0 END) +
         (CASE WHEN city IS NOT NULL THEN 1 ELSE 0 END) +
@@ -76,7 +78,7 @@ SELECT
         (CASE WHEN email IS NOT NULL THEN 1 ELSE 0 END) +
         (CASE WHEN phone IS NOT NULL THEN 1 ELSE 0 END) +
         (CASE WHEN ipv4 IS NOT NULL THEN 1 ELSE 0 END)
-    )::FLOAT
+    ), 0)::FLOAT
 FROM persons;
 """
 

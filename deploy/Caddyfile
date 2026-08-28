@@ -1,0 +1,22 @@
+# Caddy reverse proxy for the HR Insights ETL demo on an Oracle VM.
+# {$DOMAIN} is injected from the environment (see docker-compose.prod.yml).
+# Caddy automatically provisions and renews HTTPS certificates via Let's Encrypt.
+
+# Frontend (Streamlit) at the root domain.
+{$DOMAIN} {
+	encode gzip
+
+	# Grafana (optional) under /grafana.
+	handle_path /grafana/* {
+		reverse_proxy grafana:3000
+	}
+
+	# Everything else -> Streamlit frontend.
+	reverse_proxy frontend:8501
+}
+
+# API (FastAPI) at api.<domain>.
+api.{$DOMAIN} {
+	encode gzip
+	reverse_proxy api:8000
+}

@@ -4,14 +4,21 @@ These DAGs schedule periodic jobs that complement the real-time streaming pipeli
 - Gold layer refresh (every 5 minutes)
 - Batch reconciliation for duplicate detection (every 30 minutes)
 
-Requires: the ETL app's Python package installed in Airflow's environment,
-or alternatively uses BashOperator to invoke the CLI commands.
+Each DAG uses a BashOperator to invoke the ETL CLI commands. The hr_etl package is
+made importable via PYTHONPATH=/opt/airflow/src (set in docker-compose.airflow.yml),
+and its runtime deps are installed into the Airflow image (Airflow 3 uses SQLAlchemy
+2.x, matching hr_etl, so no isolated environment is required).
 """
 
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
+
+# Airflow 3: BashOperator lives in the bundled `standard` provider.
+try:  # pragma: no cover - import shim for Airflow 2/3 compatibility
+    from airflow.providers.standard.operators.bash import BashOperator
+except ImportError:  # Airflow 2.x fallback
+    from airflow.operators.bash import BashOperator
 
 default_args = {
     "owner": "hr-etl",
@@ -28,7 +35,7 @@ with DAG(
     dag_id="hr_etl_refresh_gold",
     default_args=default_args,
     description="Refresh Gold layer aggregates (stats, top cities/companies, completeness)",
-    schedule_interval="*/5 * * * *",
+    schedule="*/5 * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
     tags=["hr-etl", "gold", "medallion"],
@@ -46,7 +53,7 @@ with DAG(
     dag_id="hr_etl_reconciliation",
     default_args=default_args,
     description="Detect probable duplicate persons via name prefix matching",
-    schedule_interval="*/30 * * * *",
+    schedule="*/30 * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
     tags=["hr-etl", "reconciliation", "data-quality"],

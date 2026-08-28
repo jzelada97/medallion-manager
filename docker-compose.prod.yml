@@ -1,0 +1,59 @@
+# Production overlay for a single Oracle Cloud (OCI) Always-Free VM.
+#
+# Usage on the VM:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# What this overlay changes vs the base docker-compose.yml:
+# - Adds a Caddy reverse proxy that terminates HTTPS (automatic Let's Encrypt certs)
+#   and routes:  api.<DOMAIN> -> api:8000,  <DOMAIN> -> frontend:8501.
+# - Does NOT publish Postgres/Mongo/Redis/Prometheus/Grafana ports to the host — they
+#   stay on the internal Docker network (Rule #2: don't expose datastores).
+# - Only Caddy publishes 80/443 to the internet.
+#
+# Requirements on the VM:
+# - A domain pointing (A record) to the VM's public IP, set in the DOMAIN env var.
+#   For a quick demo without a domain you can use a nip.io host, e.g.
+#   DOMAIN=<PUBLIC_IP>.nip.io  (Caddy will still get a cert for it).
+# - Ports 80 and 443 open in BOTH the OCI security list AND the VM firewall.
+
+services:
+  # The base file publishes API/frontend/Prometheus/Grafana ports for local dev.
+  # In prod we drop those host bindings so only Caddy is reachable from outside.
+  api:
+    ports: []
+    restart: unless-stopped
+
+  frontend:
+    ports: []
+    environment:
+      API_URL: "https://api.${DOMAIN}"
+    restart: unless-stopped
+
+  prometheus:
+    ports: []
+
+  grafana:
+    ports: []
+    environment:
+      # Grafana served behind Caddy at /grafana (optional; see Caddyfile).
+      GF_SERVER_ROOT_URL: "https://${DOMAIN}/grafana/"
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+
+  caddy:
+    image: caddy:2
+    depends_on: [api, frontend]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+    networks: [hr_net]
+
+volumes:
+  caddy_data:
+  caddy_config:
