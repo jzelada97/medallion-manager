@@ -28,3 +28,38 @@ def test_clear():
     buf.add_fragment("k", {"a": 1}, "personal")
     buf.clear("k")
     assert buf.get_fragments("k") == []
+
+
+def test_register_and_resolve_alias():
+    buf = _buffer()
+    buf.register_alias("ana gil", "passport:X1")
+    # name-based key resolves to the canonical passport key on exact match
+    assert buf.resolve_alias("name:ana gil") == "passport:X1"
+
+
+def test_register_alias_ignores_empty_values():
+    buf = _buffer()
+    buf.register_alias("", "passport:X1")
+    buf.register_alias("ana gil", "")
+    # nothing was stored -> nothing resolves
+    assert buf.resolve_alias("name:ana gil") is None
+
+
+def test_resolve_alias_requires_name_prefix():
+    buf = _buffer()
+    buf.register_alias("ana gil", "passport:X1")
+    # a non name: key is never resolved
+    assert buf.resolve_alias("passport:ana gil") is None
+
+
+def test_resolve_alias_unknown_name_returns_none():
+    buf = _buffer()
+    assert buf.resolve_alias("name:desconocido") is None
+
+
+def test_resolve_alias_decodes_bytes():
+    """When the redis client returns bytes (decode_responses=False), it's decoded."""
+    client = fakeredis.FakeStrictRedis(decode_responses=False)
+    buf = RedisBuffer(client, ttl=60)
+    buf.register_alias("ana gil", "passport:X1")
+    assert buf.resolve_alias("name:ana gil") == "passport:X1"

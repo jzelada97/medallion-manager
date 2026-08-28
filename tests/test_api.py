@@ -107,3 +107,116 @@ def test_stats_endpoint(sqlite_session_factory):
     # madrid appears twice -> should be the top city
     assert body["top_cities"][0]["value"] == "madrid"
     assert body["top_cities"][0]["count"] == 2
+
+
+def test_list_persons_company_and_job_filters(sqlite_session_factory):
+    repo = PersonRepository(sqlite_session_factory)
+    repo.upsert(Person(match_key="k1", company="Acme Corp", job="Engineer"))
+    repo.upsert(Person(match_key="k2", company="Globex", job="Analyst"))
+    client = _client(sqlite_session_factory)
+
+    assert client.get("/persons", params={"company": "acme"}).json()["count"] == 1
+    assert client.get("/persons", params={"job": "analyst"}).json()["count"] == 1
+
+
+def test_candidates_endpoint(sqlite_session_factory):
+    from hr_etl.models.db_models import MatchCandidate
+
+    session = sqlite_session_factory()
+    try:
+        session.add_all(
+            [
+                MatchCandidate(person_id_a=1, person_id_b=2, confidence=0.9, reason="strong"),
+                MatchCandidate(person_id_a=3, person_id_b=4, confidence=0.3, reason="weak"),
+            ]
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    client = _client(sqlite_session_factory)
+    # default min_confidence=0.5 filters out the weak pair
+    body = client.get("/candidates").json()
+    assert body["total"] == 1
+    assert body["count"] == 1
+    assert body["items"][0]["reason"] == "strong"
+
+    # lower threshold surfaces both, ordered by confidence desc
+    body_all = client.get("/candidates", params={"min_confidence": 0.0}).json()
+    assert body_all["total"] == 2
+    assert body_all["items"][0]["confidence"] == 0.9
+
+
+def _create_sqlite_gold_tables(session_factory) -> None:
+    """Create SQLite-compatible Gold tables so the read-only endpoints can be tested.
+
+    The production Gold schema is Postgres-only (tested in test_gold_layer.py); here we
+    only need tables shaped like the ones the API reads from.
+    """
+    from sqlalchemy import text
+
+    session = session_factory()
+    try:
+        session.execute(
+            text(
+                "CREATE TABLE gold_stats (id INTEGER PRIMARY KEY, total_persons INTEGER, "
+                "with_passport INTEGER, with_city INTEGER, with_company INTEGER, "
+                "with_bank INTEGER, with_ipv4 INTEGER, cross_linked INTEGER, "
+                "avg_completeness FLOAT)"
+            )
+        )
+        session.execute(
+            text(
+                "CREATE TABLE gold_completeness (fields_filled INTEGER PRIMARY KEY, "
+                "person_count INTEGER)"
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+
+def test_gold_stats_endpoint(sqlite_session_factory):
+    _create_sqlite_gold_tables(sqlite_session_factory)
+    from sqlalchemy import text
+
+    session = sqlite_session_factory()
+    try:
+        session.execute(text("INSERT INTO gold_stats VALUES (1, 10, 8, 7, 6, 3, 2, 5, 4.5)"))
+        session.commit()
+    finally:
+        session.close()
+
+    client = _client(sqlite_session_factory)
+    body = client.get("/gold/stats").json()
+    assert body["total_persons"] == 10
+    assert body["with_passport"] == 8
+    assert body["cross_linked"] == 5
+    assert body["avg_completeness"] == 4.5
+
+
+def test_gold_stats_endpoint_not_refreshed(sqlite_session_factory):
+    _create_sqlite_gold_tables(sqlite_session_factory)  # table exists but empty
+    client = _client(sqlite_session_factory)
+    body = client.get("/gold/stats").json()
+    assert body == {"error": "gold layer not refreshed yet"}
+
+
+def test_gold_completeness_endpoint(sqlite_session_factory):
+    _create_sqlite_gold_tables(sqlite_session_factory)
+    from sqlalchemy import text
+
+    session = sqlite_session_factory()
+    try:
+        session.execute(text("INSERT INTO gold_completeness VALUES (2, 4), (5, 1)"))
+        session.commit()
+    finally:
+        session.close()
+
+    client = _client(sqlite_session_factory)
+    body = client.get("/gold/completeness").json()
+    dist = body["distribution"]
+    assert dist == [
+        {"fields_filled": 2, "count": 4},
+        {"fields_filled": 5, "count": 1},
+    ]

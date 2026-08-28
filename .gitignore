@@ -24,6 +24,8 @@ htmlcov/
 # Local-only notes / roadmap (NOT for the repo, personal working notes)
 ROADMAP.local.md
 *.local.md
+# Personal deploy guide (kept local; the rest of deploy/ is committed)
+deploy/DEPLOY-oracle.md
 
 # IDE / OS
 .vscode/

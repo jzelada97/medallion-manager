@@ -9,7 +9,7 @@ Run: python -m hr_etl.processing.reconcile
 
 from __future__ import annotations
 
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, delete
 from sqlalchemy.orm import Session
 
 from hr_etl.logging_conf import get_logger
@@ -38,11 +38,7 @@ def find_candidates(session: Session, min_confidence: float = 0.5) -> list[Match
     """
     # Get all persons with a usable name, grouped by key type
     all_persons = (
-        session.execute(
-            select(PersonRow).where(PersonRow.full_name.isnot(None))
-        )
-        .scalars()
-        .all()
+        session.execute(select(PersonRow).where(PersonRow.full_name.isnot(None))).scalars().all()
     )
 
     passport_persons = [p for p in all_persons if p.match_key.startswith("passport:")]
@@ -87,7 +83,9 @@ def find_candidates(session: Session, min_confidence: float = 0.5) -> list[Match
             if pp and prefix != np_name:
                 confidence = round(len(prefix) / len(np_name), 3)
                 if confidence >= min_confidence:
-                    _add_candidate(pp, np, confidence, f"passport_prefix: '{prefix}' -> '{np_name}'")
+                    _add_candidate(
+                        pp, np, confidence, f"passport_prefix: '{prefix}' -> '{np_name}'"
+                    )
                 break
 
     # Strategy 2: name-based records that are prefixes of each other

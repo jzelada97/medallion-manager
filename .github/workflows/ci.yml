@@ -1,0 +1,127 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ------------------------------------------------------------------
+  # Lint + unit/integration tests against real Postgres/Mongo/Redis
+  # (GitHub Actions service containers).
+  # ------------------------------------------------------------------
+  unit:
+    name: Lint & tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: hr_warehouse
+          POSTGRES_USER: hr_user
+          POSTGRES_PASSWORD: changeme
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U hr_user -d hr_warehouse"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+      mongo:
+        image: mongo:7
+        env:
+          MONGO_INITDB_ROOT_USERNAME: hr_user
+          MONGO_INITDB_ROOT_PASSWORD: changeme
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --quiet --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,frontend]"
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Format check (black)
+        run: black --check .
+
+      - name: Run tests with coverage
+        env:
+          TEST_POSTGRES_DSN: postgresql+psycopg2://hr_user:changeme@localhost:5432/hr_warehouse
+          TEST_MONGO_URI: mongodb://hr_user:changeme@localhost:27017/
+          # Redis has no password in the CI service container.
+          REDIS_PASSWORD: ""
+        run: pytest -q
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: ignore
+
+  # ------------------------------------------------------------------
+  # Deferrable-sensor tests: they need the real apache-airflow package,
+  # so we run them inside the Airflow container (as the run-airflow-tests
+  # script does locally). This job spins the Airflow stack up on the runner.
+  # ------------------------------------------------------------------
+  airflow:
+    name: Airflow sensor tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start base infra (postgres/mongo/redis)
+        run: docker compose up -d postgres mongo redis
+
+      - name: Start Airflow stack
+        run: docker compose -f docker-compose.airflow.yml up -d
+
+      - name: Wait for the Airflow scheduler to be ready
+        run: |
+          for i in $(seq 1 40); do
+            if docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow version >/dev/null 2>&1; then
+              echo "scheduler ready"; exit 0
+            fi
+            echo "waiting for scheduler... ($i)"; sleep 10
+          done
+          echo "scheduler did not become ready in time" >&2
+          docker compose -f docker-compose.airflow.yml logs --tail 50 || true
+          exit 1
+
+      - name: Run deferrable-sensor tests inside the container
+        run: bash scripts/run-airflow-tests.sh
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose -f docker-compose.airflow.yml down -v || true
+          docker compose down -v || true

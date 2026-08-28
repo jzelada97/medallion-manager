@@ -1,0 +1,137 @@
+# Apache Airflow 3.3.1 (Experto+) — separate compose file so the heavy Airflow image
+# is opt-in and never slows down the main stack.
+#
+# Usage (the main stack must be up first, so the `hr_net` network and Postgres exist):
+#   docker compose up -d postgres mongo redis
+#   docker compose -f docker-compose.airflow.yml up -d
+#   UI -> http://localhost:8080  (admin / admin)
+#
+# The DAGs run `python -m hr_etl.warehouse.gold_layer` and
+# `python -m hr_etl.processing.reconcile`. The Airflow 3.3.1 image already bundles
+# SQLAlchemy 2.x, pydantic 2.11+, pydantic-settings and psycopg2 — the same runtime
+# deps hr_etl uses — so no extra pip installs and no isolated venv are needed. We just
+# mount ./src and put it on PYTHONPATH so `python -m hr_etl...` resolves.
+#
+# Airflow keeps its own metadata in a separate `airflow` database on the same Postgres
+# server (created by the init service), isolated from the hr_warehouse database.
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:3.3.1
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://hr_user:changeme@postgres:5432/airflow
+    # Airflow 3 tasks (Task SDK) call back to the api-server's Task Execution API over
+    # HTTP. In this multi-container setup that server is the `airflow-api-server`
+    # service, not localhost — without this the workers get "Connection refused".
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-api-server:8080/execution/
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    # Deterministic secrets so the api-server and workers agree (dev/demo only).
+    AIRFLOW__CORE__FERNET_KEY: "fKp9Wq3sT7vX1yZ4bC6dE8gH0jK2mN5pQ7rS9tU1wX3="
+    AIRFLOW__API_AUTH__JWT_SECRET: "hr-etl-airflow-jwt-secret-demo"
+    # Airflow 3 ships the "simple auth manager" by default. Define the admin user and
+    # pin its password to a deterministic file (seeded by airflow-init) so login is
+    # admin/admin. This is a dev/demo convenience only.
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_PASSWORDS_FILE: /opt/airflow/simple-auth/passwords.json
+    # The Airflow 3.3.1 image already bundles everything hr_etl needs at runtime
+    # (SQLAlchemy 2.x, pydantic 2.11+, pydantic-settings, psycopg2). We deliberately
+    # do NOT pin/override those versions here — forcing hr_etl's exact pins would
+    # downgrade Airflow's own deps and break it. No _PIP_ADDITIONAL_REQUIREMENTS needed.
+    # Make the hr_etl package importable by the DAG BashOperators.
+    PYTHONPATH: /opt/airflow/src
+    # ETL config so the CLIs connect to the same infra as the main stack.
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: "5432"
+    POSTGRES_DB: hr_warehouse
+    POSTGRES_USER: hr_user
+    POSTGRES_PASSWORD: changeme
+    MONGO_URI: mongodb://hr_user:changeme@mongo:27017/
+    REDIS_HOST: redis
+    REDIS_PORT: "6379"
+    REDIS_PASSWORD: changeme
+    LOG_LEVEL: INFO
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags:ro
+    - ./src:/opt/airflow/src:ro
+    - airflow_logs:/opt/airflow/logs
+    - airflow_auth:/opt/airflow/simple-auth
+  networks: [hr_net]
+
+services:
+  # One-shot init: create the `airflow` metadata DB, run migrations, seed the admin
+  # password file. Runs as root so it can write the seed file into the (root-owned)
+  # shared auth volume and hand ownership to the airflow user (uid 50000).
+  airflow-init:
+    <<: *airflow-common
+    user: "0:0"
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        python -c "import psycopg2, time
+        while True:
+            try:
+                psycopg2.connect(host='postgres', user='hr_user', password='changeme', dbname='hr_warehouse').close(); break
+            except Exception as e:
+                print('waiting for postgres...', e); time.sleep(3)"
+        python -c "import psycopg2
+        c = psycopg2.connect(host='postgres', user='hr_user', password='changeme', dbname='hr_warehouse'); c.autocommit=True
+        cur=c.cursor(); cur.execute(\"SELECT 1 FROM pg_database WHERE datname='airflow'\")
+        if not cur.fetchone(): cur.execute('CREATE DATABASE airflow'); print('created airflow db')
+        else: print('airflow db exists')"
+        # Airflow 3 uses the simple auth manager; there is no `airflow users create`.
+        # Seed the passwords file so the admin user logs in with a fixed password,
+        # then hand the auth dir to the airflow user so the api-server can read it.
+        mkdir -p /opt/airflow/simple-auth
+        echo '{"admin": "admin"}' > /opt/airflow/simple-auth/passwords.json
+        chown -R 50000:0 /opt/airflow/simple-auth
+        echo "seeded simple auth admin/admin"
+        # Run migrations as the airflow user (owns HOME/config).
+        runuser -u airflow -- airflow db migrate
+    restart: "no"
+
+  airflow-api-server:
+    <<: *airflow-common
+    command: api-server
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  # Runs the async event loop for deferrable tasks (our PersonsThresholdSensor).
+  # Without it, a task that calls self.defer(...) would stay stuck in "deferred".
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  airflow_logs:
+  airflow_auth:
+
+networks:
+  hr_net:
+    external: true
+    name: proyecto1_modulo3_de2_hr_net
