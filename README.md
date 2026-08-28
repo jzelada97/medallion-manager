@@ -633,5 +633,3 @@ En cada push/PR a `main` o `dev` se ejecuta `.github/workflows/ci.yml`:
 Pensado para una **VM del Always Free de Oracle Cloud**: overlay de producción
 `docker-compose.prod.yml` + `deploy/Caddyfile` (HTTPS automático con Caddy, bases de
 datos no expuestas al exterior) y script de arranque `deploy/setup-oracle-vm.sh`.
-Para practicar el flujo de OCI antes del stack completo hay un ensayo mínimo en
-[`deploy/oracle-hello/`](deploy/oracle-hello/README.md).
