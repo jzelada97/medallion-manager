@@ -183,9 +183,7 @@ def build_router(session_factory) -> APIRouter:
         """Pre-computed Gold layer statistics (faster than live aggregation)."""
         session = session_factory()
         try:
-            row = session.execute(
-                text("SELECT * FROM gold_stats WHERE id = 1")
-            ).fetchone()
+            row = session.execute(text("SELECT * FROM gold_stats WHERE id = 1")).fetchone()
             if row is None:
                 return {"error": "gold layer not refreshed yet"}
             return {
@@ -207,12 +205,13 @@ def build_router(session_factory) -> APIRouter:
         session = session_factory()
         try:
             rows = session.execute(
-                text("SELECT fields_filled, person_count FROM gold_completeness ORDER BY fields_filled")
+                text(
+                    "SELECT fields_filled, person_count FROM gold_completeness ORDER BY fields_filled"
+                )
             ).fetchall()
             return {
                 "distribution": [
-                    {"fields_filled": r.fields_filled, "count": r.person_count}
-                    for r in rows
+                    {"fields_filled": r.fields_filled, "count": r.person_count} for r in rows
                 ]
             }
         finally:

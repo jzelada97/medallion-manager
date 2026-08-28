@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from airflow.sdk.bases.sensor import BaseSensorOperator
@@ -110,9 +110,7 @@ class NewPersonsTrigger(BaseTrigger):
     async def run(self) -> AsyncIterator[TriggerEvent]:
         import asyncio
 
-        watermark = (
-            datetime.fromisoformat(self.watermark_iso) if self.watermark_iso else None
-        )
+        watermark = datetime.fromisoformat(self.watermark_iso) if self.watermark_iso else None
         while True:
             count = await _count_new_persons(self.dsn, watermark)
             if count >= self.min_new:
@@ -145,9 +143,7 @@ class NewPersonsSensor(BaseSensorOperator):
     ) -> None:
         super().__init__(**kwargs)
         self.min_new = min_new if min_new is not None else _default_min_new()
-        self.poll_interval = (
-            poll_interval if poll_interval is not None else _default_poll()
-        )
+        self.poll_interval = poll_interval if poll_interval is not None else _default_poll()
 
     def _read_watermark(self) -> datetime | None:
         """Last Gold refresh time from gold_stats.updated_at (None if never refreshed)."""

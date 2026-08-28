@@ -162,7 +162,7 @@ def main() -> None:
     with engine.connect() as conn:
         row = conn.execute(text("SELECT * FROM gold_stats WHERE id = 1")).fetchone()
         if row:
-            print(f"Gold layer refreshed:")
+            print("Gold layer refreshed:")
             print(f"  Total persons: {row.total_persons}")
             print(f"  With passport: {row.with_passport}")
             print(f"  Cross-linked:  {row.cross_linked}")

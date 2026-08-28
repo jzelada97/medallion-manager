@@ -60,7 +60,11 @@ omit = [
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# The data generator is third-party (Factoría F5) provided as a git submodule.
+# It is not our code — never lint/format/reformat it.
+extend-exclude = ["data-generator"]
 
 [tool.black]
 line-length = 100
 target-version = ["py312"]
+extend-exclude = "data-generator"
