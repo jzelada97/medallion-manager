@@ -7,7 +7,7 @@ from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import func, or_, select, text
 
-from hr_etl.models.db_models import MatchCandidate, PersonRow
+from hr_etl.models.db_models import DuplicateGroup, MatchCandidate, PersonRow
 
 
 def _row_to_dict(row: PersonRow) -> dict:
@@ -179,6 +179,68 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
                     }
                     for r in rows
                 ],
+            }
+        finally:
+            session.close()
+
+    @router.get("/groups")
+    def list_duplicate_groups(
+        limit: int = Query(50, ge=1, le=500),
+        min_confidence: float = Query(0.5, ge=0.0, le=1.0),
+    ) -> dict:
+        """List probable-duplicate GROUPS detected by fuzzy reconciliation.
+
+        Each group bundles several person records that likely refer to the same
+        individual (fuzzy name similarity + optional corroboration). Members are
+        grouped by ``group_id``; each includes the person's name/city/company so the
+        UI can show them side by side.
+        """
+        session = session_factory()
+        try:
+            # Fetch memberships above the confidence threshold, joined to the person so
+            # the UI has names/city/company without extra round-trips.
+            stmt = (
+                select(
+                    DuplicateGroup.group_id,
+                    DuplicateGroup.person_id,
+                    DuplicateGroup.confidence,
+                    DuplicateGroup.reason,
+                    PersonRow.full_name,
+                    PersonRow.city,
+                    PersonRow.company,
+                )
+                .join(PersonRow, PersonRow.id == DuplicateGroup.person_id)
+                .where(DuplicateGroup.confidence >= min_confidence)
+                .order_by(DuplicateGroup.group_id, DuplicateGroup.person_id)
+            )
+            rows = session.execute(stmt).all()
+
+            # Bundle rows by group_id.
+            groups: dict[int, dict] = {}
+            for r in rows:
+                g = groups.setdefault(
+                    r.group_id,
+                    {"group_id": r.group_id, "confidence": 0.0, "reason": r.reason, "members": []},
+                )
+                g["confidence"] = max(g["confidence"], r.confidence)
+                g["members"].append(
+                    {
+                        "person_id": r.person_id,
+                        "full_name": r.full_name,
+                        "city": r.city,
+                        "company": r.company,
+                    }
+                )
+
+            # Only groups with >= 2 members are real duplicates; sort by confidence.
+            group_list = [g for g in groups.values() if len(g["members"]) >= 2]
+            group_list.sort(key=lambda g: g["confidence"], reverse=True)
+            limited = group_list[:limit]
+
+            return {
+                "total_groups": len(group_list),
+                "count": len(limited),
+                "groups": limited,
             }
         finally:
             session.close()

@@ -6,6 +6,10 @@
 {$DOMAIN} {
 	encode gzip
 
+	# Redirect the bare /grafana (no trailing slash) to /grafana/ so users who
+	# type it without the slash don't fall through to Streamlit.
+	redir /grafana /grafana/
+
 	# Grafana (optional) under /grafana.
 	# Use `handle` (not `handle_path`) so the /grafana prefix is preserved when
 	# proxied. Grafana runs with GF_SERVER_SERVE_FROM_SUB_PATH=true and a root_url

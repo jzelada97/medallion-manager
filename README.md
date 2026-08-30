@@ -309,25 +309,37 @@ valor persistido conserva el original.
 ### Batch Reconciliation (match_candidates)
 
 Para abordar los casos ambiguos donde el matching en streaming no puede decidir, implementamos un
-**job batch de reconciliacion** que analiza el warehouse y detecta pares de registros que
-*probablemente* son la misma persona:
+**job batch de reconciliacion** que analiza el warehouse y **agrupa** registros que
+*probablemente* son la misma persona. Decisiones de diseño relevantes:
 
-- **Tabla `match_candidates`**: almacena pares (person_id_a, person_id_b) con un score de confianza
-  (0.0 a 1.0) y la razon del match hipotetico.
-- **Estrategias de deteccion**:
-  1. Registros con passport cuyo nombre es prefijo de un registro por nombre (ej: "octavio ponce" -> "octavio ponce gimenez")
-  2. Registros por nombre que son prefijos entre si
-- **Confianza** = longitud_prefijo / longitud_total. A mayor cobertura, mas probable que sea la misma persona.
-- **Nunca se auto-mergean** — quedan como candidatos para revision humana o un threshold de confianza.
+- **Todo en SQL (Postgres), no en Python.** La version inicial cargaba toda la tabla
+  `persons` en memoria de Python y agrupaba con diccionarios; con millones de filas eso
+  agota la RAM (llego a tumbar la VM de demo). Ahora la deteccion (normalizacion,
+  similitud, agrupacion) corre dentro de Postgres y solo vuelven las filas de pertenencia.
+- **Similitud difusa con `pg_trgm`.** El match exacto no detecta duplicados reales como
+  "leclerc" vs "leclercq" (una letra) o "martinez" vs "martenez" (letra cambiada). La
+  extension `pg_trgm` puntua similitud de cadenas (0..1) con indice, asi que los captura
+  a escala. Umbral estricto (0.85) para pocos falsos positivos.
+- **Blocking por primera palabra del nombre.** Comparar todos contra todos es O(n^2). Solo
+  se comparan nombres que comparten su primera palabra (mismo nombre de pila), tecnica
+  estandar de *blocking* en entity resolution.
+- **Grupos, no pares** (tabla `duplicate_groups`): varios registros de la misma persona
+  comparten `group_id` (el id minimo del grupo, ancla canonica). Una fila por miembro.
+- **Agrupacion por ancla, NO clustering de componentes conexos.** Convertir pares en
+  grupos transitivos (A~B, B~C ⇒ {A,B,C}) requeriria Union-Find (algoritmo imperativo,
+  mal encaje con SQL y obligaria a cargar el grafo en memoria) o una CTE recursiva
+  (costosa en tiempo/memoria sobre datos densos, arriesgado en la VM pequeña). Se
+  descarto a proposito: el ancla es correcto para la gran mayoria de nombres de personas
+  y evita ese coste. Documentado en `processing/reconcile.py`.
+- **Nunca se auto-mergean** — son candidatos para revision humana.
 
 Ejecucion: `python -m hr_etl.processing.reconcile`
-API: `GET /candidates?min_confidence=0.8`
+API: `GET /groups?min_confidence=0.85`
+Frontend: pestaña **Duplicados** (muestra los grupos y el detalle de cada miembro).
 
-Ejemplo de resultado:
-```
-crystal cunningham (passport:445725093) <-> Crystal Cunningham MD  | confianza: 0.86
-octavio ponce (passport:140749868)      <-> Octavio Ponce Gimenez  | confianza: 0.74
-```
+> Nota: `match_candidates` (pares) queda como tabla legacy; el modelo activo es
+> `duplicate_groups` (grupos). En una BD existente, hacer `DROP TABLE` de la vieja es
+> seguro porque la reconciliacion reconstruye todo en cada pasada.
 
 ### Analisis de los datos del generador (hallazgos)
 
@@ -442,7 +454,8 @@ Base URL: `http://localhost:8000`
 | `/persons` | GET | Listado con paginacion y busqueda |
 | `/persons/{id}` | GET | Detalle de una persona (404 si no existe) |
 | `/stats` | GET | Estadisticas agregadas (Silver, en vivo) |
-| `/candidates` | GET | Posibles duplicados de la reconciliacion (`min_confidence`, `limit`) |
+| `/candidates` | GET | Pares candidatos (reconciliacion legacy por pares) |
+| `/groups` | GET | Grupos de duplicados por similitud difusa (`min_confidence`, `limit`) |
 | `/gold/stats` | GET | Estadisticas precomputadas (capa Gold) |
 | `/gold/completeness` | GET | Distribucion de completitud de campos (Gold) |
 | `/medallion` | GET | Conteos de las 3 capas Bronze/Silver/Gold para el dashboard |

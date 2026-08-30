@@ -1,177 +1,191 @@
-"""Unit tests for the batch reconciliation job (processing/reconcile).
+"""Integration tests for the fuzzy batch reconciliation (processing/reconcile).
 
-These run fully in-memory against SQLite (no Postgres/Mongo needed) using the
-shared `sqlite_session_factory` fixture. The reconciliation logic operates on the
-`persons` table via the SQLAlchemy ORM, which is portable to SQLite, so no
-integration marker is required here.
+Reconciliation runs its detection in SQL using the ``pg_trgm`` extension (fuzzy name
+similarity) and groups probable duplicates into ``duplicate_groups``. These are
+integration tests against a REAL PostgreSQL — the SQL uses Postgres-specific features
+(pg_trgm's ``similarity()``, ``split_part``, ``regexp_replace``) that SQLite lacks.
+
+Connects via TEST_POSTGRES_DSN (defaults to the docker-compose Postgres on
+localhost:5432). If no Postgres is reachable, the module is skipped.
+
+Run it with the stack up:
+    docker compose up -d postgres
+    set TEST_POSTGRES_DSN=postgresql+psycopg2://hr_user:changeme@localhost:5432/hr_warehouse
+    pytest -m integration
 """
 
 from __future__ import annotations
 
-from hr_etl.models.db_models import MatchCandidate, PersonRow
-from hr_etl.processing.reconcile import (
-    _normalize_name,
-    find_candidates,
-    run_reconciliation,
+import os
+
+import pytest
+
+pytest.importorskip("psycopg2", reason="psycopg2 not installed")
+
+from sqlalchemy import text  # noqa: E402
+
+from hr_etl.models.db_models import Base, DuplicateGroup, PersonRow  # noqa: E402
+from hr_etl.processing.reconcile import run_reconciliation  # noqa: E402
+from hr_etl.warehouse.engine import (  # noqa: E402
+    create_db_engine,
+    init_schema,
+    make_session_factory,
+)
+
+DSN = os.getenv(
+    "TEST_POSTGRES_DSN",
+    "postgresql+psycopg2://hr_user:changeme@localhost:5432/hr_warehouse",
 )
 
 
-def _add_person(session, match_key: str, full_name: str | None) -> PersonRow:
-    row = PersonRow(match_key=match_key, full_name=full_name)
+def _postgres_available() -> bool:
+    try:
+        engine = create_db_engine(DSN)
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        engine.dispose()
+        return True
+    except Exception:
+        return False
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not _postgres_available(), reason="no PostgreSQL reachable at TEST_POSTGRES_DSN"
+    ),
+]
+
+
+@pytest.fixture()
+def pg_session_factory():
+    engine = create_db_engine(DSN)
+    Base.metadata.drop_all(engine)
+    init_schema(engine)
+    factory = make_session_factory(engine)
+    yield factory
+    Base.metadata.drop_all(engine)
+    engine.dispose()
+
+
+def _add_person(session, match_key: str, full_name: str | None, **kwargs) -> PersonRow:
+    row = PersonRow(match_key=match_key, full_name=full_name, **kwargs)
     session.add(row)
-    session.flush()  # assign id without committing
+    session.flush()
     return row
 
 
-# ----------------------------------------------------------------------
-# _normalize_name helper
-# ----------------------------------------------------------------------
-
-
-def test_normalize_name_none_and_empty():
-    assert _normalize_name(None) == ""
-    assert _normalize_name("") == ""
-
-
-def test_normalize_name_strips_accents_titles_and_case():
-    # lowercase + accents removed + honorific title stripped
-    assert _normalize_name("Dr. Álvaro Núñez") == "alvaro nunez"
-    assert _normalize_name("  MRS.   Ana  Gil  ") == "ana gil"
+def _groups(session) -> dict[int, list[DuplicateGroup]]:
+    """Return current memberships bundled by group_id."""
+    out: dict[int, list[DuplicateGroup]] = {}
+    for m in session.query(DuplicateGroup).all():
+        out.setdefault(m.group_id, []).append(m)
+    return out
 
 
 # ----------------------------------------------------------------------
-# Strategy 1: passport-record name is a prefix of a name-record name
+# Fuzzy name similarity groups near-identical names (typos, extra surname)
 # ----------------------------------------------------------------------
 
 
-def test_find_candidates_passport_prefix_of_name(sqlite_session_factory):
-    session = sqlite_session_factory()
+def test_fuzzy_groups_typo_surname(pg_session_factory):
+    session = pg_session_factory()
     try:
-        pp = _add_person(session, "passport:X1", "octavio ponce")
-        np = _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez")
+        # One-letter difference at the end: exact matching would miss this.
+        a = _add_person(session, "passport:X1", "jean leclerc")
+        b = _add_person(session, "name:jean leclercq", "jean leclercq")
+        session.commit()
 
-        candidates = find_candidates(session, min_confidence=0.5)
+        n = run_reconciliation(session, similarity_threshold=0.6)
 
-        assert len(candidates) == 1
-        cand = candidates[0]
-        # pair stored sorted (min id, max id)
-        assert cand.person_id_a == min(pp.id, np.id)
-        assert cand.person_id_b == max(pp.id, np.id)
-        assert cand.reason.startswith("passport_prefix:")
-        # confidence = len('octavio ponce') / len('octavio ponce gimenez')
-        expected = round(len("octavio ponce") / len("octavio ponce gimenez"), 3)
-        assert cand.confidence == expected
+        assert n >= 2  # both land in a group
+        groups = _groups(session)
+        # exactly one group containing both persons
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
     finally:
         session.close()
 
 
-def test_find_candidates_min_confidence_filters_out_weak_pairs(sqlite_session_factory):
-    session = sqlite_session_factory()
+def test_group_anchored_to_min_id(pg_session_factory):
+    session = pg_session_factory()
     try:
-        # short passport name ("ana") vs a much longer name record -> low confidence
-        _add_person(session, "passport:X1", "ana")
-        _add_person(session, "name:ana beatriz carla dominguez", "ana beatriz carla dominguez")
+        a = _add_person(session, "passport:X1", "maria lopez")
+        b = _add_person(session, "name:maria lopezz", "maria lopezz")
+        session.commit()
 
-        # default 0.5 should discard this weak match
-        assert find_candidates(session, min_confidence=0.5) == []
+        run_reconciliation(session, similarity_threshold=0.6)
 
-        # a very permissive threshold should surface it
-        loose = find_candidates(session, min_confidence=0.1)
-        assert len(loose) == 1
-        assert loose[0].confidence < 0.5
+        groups = _groups(session)
+        assert len(groups) == 1
+        gid = next(iter(groups))
+        # group_id is the smallest person id (canonical anchor)
+        assert gid == min(a.id, b.id)
+    finally:
+        session.close()
+
+
+def test_same_city_marked_in_reason(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        _add_person(session, "passport:X1", "ana gil", city="Madrid")
+        _add_person(session, "name:ana gill", "ana gill", city="Madrid")
+        session.commit()
+
+        run_reconciliation(session, similarity_threshold=0.6)
+
+        reasons = [m.reason for m in session.query(DuplicateGroup).all()]
+        assert any("same city" in r for r in reasons)
     finally:
         session.close()
 
 
 # ----------------------------------------------------------------------
-# Strategy 2: two name-records where one name is a prefix of the other
+# Non-duplicates and edge cases
 # ----------------------------------------------------------------------
 
 
-def test_find_candidates_name_prefix_of_name(sqlite_session_factory):
-    session = sqlite_session_factory()
+def test_distinct_names_no_group(pg_session_factory):
+    session = pg_session_factory()
     try:
-        a = _add_person(session, "name:maria lopez", "maria lopez")
-        b = _add_person(session, "name:maria lopez ruiz", "maria lopez ruiz")
-
-        candidates = find_candidates(session, min_confidence=0.5)
-
-        assert len(candidates) == 1
-        cand = candidates[0]
-        assert cand.person_id_a == min(a.id, b.id)
-        assert cand.person_id_b == max(a.id, b.id)
-        assert cand.reason.startswith("name_prefix:")
-        expected = round(len("maria lopez") / len("maria lopez ruiz"), 3)
-        assert cand.confidence == expected
-    finally:
-        session.close()
-
-
-def test_find_candidates_ignores_short_and_null_names(sqlite_session_factory):
-    session = sqlite_session_factory()
-    try:
-        # names shorter than 3 chars are ignored; NULL full_name filtered by query
-        _add_person(session, "passport:X1", "ab")
-        _add_person(session, "name:ab", "ab")
-        _add_person(session, "passport:X2", None)
-
-        assert find_candidates(session) == []
-    finally:
-        session.close()
-
-
-def test_find_candidates_no_self_match_for_identical_names(sqlite_session_factory):
-    session = sqlite_session_factory()
-    try:
-        # identical normalized names are not flagged (prefix != full requirement)
+        # Different first-word blocks -> never compared; clearly not duplicates.
         _add_person(session, "passport:X1", "ana gil")
-        _add_person(session, "name:ana gil", "ana gil")
-
-        assert find_candidates(session) == []
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# run_reconciliation: persistence + rebuild semantics
-# ----------------------------------------------------------------------
-
-
-def test_run_reconciliation_persists_candidates(sqlite_session_factory):
-    session = sqlite_session_factory()
-    try:
-        _add_person(session, "passport:X1", "octavio ponce")
-        _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez")
+        _add_person(session, "name:pedro ramirez", "pedro ramirez")
         session.commit()
 
-        count = run_reconciliation(session, min_confidence=0.5)
-
-        assert count == 1
-        stored = session.query(MatchCandidate).all()
-        assert len(stored) == 1
-        assert stored[0].reason.startswith("passport_prefix:")
+        assert run_reconciliation(session, similarity_threshold=0.85) == 0
     finally:
         session.close()
 
 
-def test_run_reconciliation_rebuilds_and_clears_previous(sqlite_session_factory):
-    session = sqlite_session_factory()
+def test_high_threshold_rejects_weak_similarity(pg_session_factory):
+    session = pg_session_factory()
     try:
-        # stale candidate left over from a previous run
-        session.add(MatchCandidate(person_id_a=99, person_id_b=100, confidence=0.9, reason="stale"))
+        # Same block ("carlos") but the surnames are quite different.
+        _add_person(session, "passport:X1", "carlos mendez")
+        _add_person(session, "name:carlos villanueva", "carlos villanueva")
         session.commit()
 
-        # no matching persons this run -> should end up with zero candidates
-        count = run_reconciliation(session, min_confidence=0.5)
-
-        assert count == 0
-        assert session.query(MatchCandidate).count() == 0
+        # A strict threshold should not group them.
+        assert run_reconciliation(session, similarity_threshold=0.9) == 0
     finally:
         session.close()
 
 
-def test_run_reconciliation_empty_warehouse(sqlite_session_factory):
-    session = sqlite_session_factory()
+def test_rebuild_clears_previous(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        session.add(DuplicateGroup(group_id=1, person_id=1, confidence=0.9, reason="stale"))
+        session.commit()
+
+        # No persons this run -> stale rows cleared, zero written.
+        assert run_reconciliation(session) == 0
+        assert session.query(DuplicateGroup).count() == 0
+    finally:
+        session.close()
+
+
+def test_empty_warehouse(pg_session_factory):
+    session = pg_session_factory()
     try:
         assert run_reconciliation(session) == 0
     finally:

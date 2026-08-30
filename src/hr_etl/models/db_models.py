@@ -60,3 +60,28 @@ class MatchCandidate(Base):
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     reason: Mapped[str] = mapped_column(String(255), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class DuplicateGroup(Base):
+    """A member of a probable-duplicate GROUP detected by fuzzy reconciliation.
+
+    Unlike ``match_candidates`` (which stores binary pairs), this table models
+    duplicates as *groups*: several person records that likely refer to the same
+    individual share the same ``group_id``. One row per member.
+
+    ``group_id`` is the smallest person id in the group (a stable canonical
+    representative). ``confidence`` is the fuzzy-name similarity that put this member
+    in the group; ``reason`` explains the signal (e.g. name similarity + same city).
+
+    Populated by ``processing/reconcile.py`` via a full rebuild each run. Never
+    auto-merged — these are review candidates.
+    """
+
+    __tablename__ = "duplicate_groups"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    group_id: Mapped[int] = mapped_column(index=True)
+    person_id: Mapped[int] = mapped_column(index=True)
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    reason: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

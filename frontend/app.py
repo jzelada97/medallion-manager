@@ -267,26 +267,24 @@ with tab_persons:
 
 
 # --------------------------------------------------------------------------- #
-# Tab 2: Duplicados (match candidates from batch reconciliation)
+# Tab 2: Duplicados (groups from fuzzy batch reconciliation)
 # --------------------------------------------------------------------------- #
-def _person_label(person: dict | None, fallback_id: int) -> str:
-    """Compact one-line label for a person, for side-by-side comparison."""
-    if not person:
-        return f"#{fallback_id} (no encontrado)"
-    name = person.get("full_name") or "(sin nombre)"
-    bits = [f"#{person.get('id', fallback_id)}", name]
-    if person.get("city"):
-        bits.append(person["city"])
-    if person.get("company"):
-        bits.append(person["company"])
+def _member_label(m: dict) -> str:
+    """Compact one-line label for a group member."""
+    bits = [f"#{m.get('person_id')}", m.get("full_name") or "(sin nombre)"]
+    if m.get("city"):
+        bits.append(m["city"])
+    if m.get("company"):
+        bits.append(m["company"])
     return " · ".join(str(b) for b in bits)
 
 
 with tab_dupes:
     st.subheader("Posibles duplicados")
     st.caption(
-        "Pares de personas con nombres parecidos que podrían ser la misma. "
-        "Los genera la reconciliación por lotes y se guardan en `match_candidates`."
+        "Grupos de personas con nombres parecidos (similitud difusa) que podrían ser "
+        "la misma. Los genera la reconciliación por lotes y se guardan en "
+        "`duplicate_groups`."
     )
 
     min_conf = st.slider(
@@ -295,45 +293,41 @@ with tab_dupes:
         max_value=1.0,
         value=0.5,
         step=0.05,
-        help="Solo muestra pares cuya confianza de coincidencia supere este umbral.",
+        help="Solo muestra grupos cuya similitud de nombre supere este umbral.",
     )
-    max_rows = st.number_input("Máx. resultados", min_value=1, max_value=500, value=100, step=25)
+    max_groups = st.number_input("Máx. grupos", min_value=1, max_value=500, value=100, step=25)
 
-    dupes = api_get("/candidates", {"limit": int(max_rows), "min_confidence": float(min_conf)}) or {
-        "total": 0,
+    data = api_get("/groups", {"limit": int(max_groups), "min_confidence": float(min_conf)}) or {
+        "total_groups": 0,
         "count": 0,
-        "items": [],
+        "groups": [],
     }
-    dup_total = dupes.get("total", 0)
-    dup_items = dupes.get("items", [])
+    total_groups = data.get("total_groups", 0)
+    groups = data.get("groups", [])
 
     st.caption(
-        f"{dup_total} candidato(s) por encima de {min_conf:.2f} · " f"mostrando {len(dup_items)}"
+        f"{total_groups} grupo(s) por encima de {min_conf:.2f} · " f"mostrando {len(groups)}"
     )
 
-    if not dup_items:
+    if not groups:
         st.info(
-            "No hay candidatos a duplicado todavía. Ejecuta la reconciliación "
+            "No hay grupos de duplicados todavía. Ejecuta la reconciliación "
             "(DAG `hr_etl_reconciliation` en Airflow, o "
             "`python -m hr_etl.processing.reconcile`) y vuelve a mirar."
         )
     else:
-        df_dupes = pd.DataFrame(dup_items)
-        # Human-friendly column order/labels.
-        rename = {
-            "id": "id",
-            "person_id_a": "persona A",
-            "person_id_b": "persona B",
-            "confidence": "confianza",
-            "reason": "motivo",
-        }
-        show_cols = [
-            c
-            for c in ["id", "person_id_a", "person_id_b", "confidence", "reason"]
-            if c in df_dupes.columns
+        # Summary table: one row per group.
+        summary = [
+            {
+                "grupo": g["group_id"],
+                "miembros": len(g["members"]),
+                "confianza": g["confidence"],
+                "motivo": g.get("reason", ""),
+            }
+            for g in groups
         ]
         st.dataframe(
-            df_dupes[show_cols].rename(columns=rename),
+            pd.DataFrame(summary),
             use_container_width=True,
             hide_index=True,
             column_config={
@@ -343,29 +337,29 @@ with tab_dupes:
             },
         )
 
-        # --- Side-by-side comparison of a selected pair ---
-        st.subheader("Comparar par")
+        # --- Inspect a selected group: list its members side by side ---
+        st.subheader("Inspeccionar grupo")
         labels = {
-            f"#{r['id']} · A={r['person_id_a']} ↔ B={r['person_id_b']} "
-            f"({r.get('confidence', 0):.2f})": r
-            for r in dup_items
+            f"Grupo #{g['group_id']} · {len(g['members'])} personas " f"({g['confidence']:.2f})": g
+            for g in groups
         }
-        choice = st.selectbox("Selecciona un par para compararlo", list(labels.keys()))
+        choice = st.selectbox("Selecciona un grupo", list(labels.keys()))
         if choice:
-            pair = labels[choice]
-            pa = api_get(f"/persons/{pair['person_id_a']}")
-            pb = api_get(f"/persons/{pair['person_id_b']}")
-
+            group = labels[choice]
             st.markdown(
-                f"**Confianza:** {pair.get('confidence', 0):.2f}  ·  "
-                f"**Motivo:** {pair.get('reason', '—')}"
+                f"**Confianza:** {group['confidence']:.2f}  ·  "
+                f"**Motivo:** {group.get('reason', '—')}  ·  "
+                f"**{len(group['members'])} personas**"
             )
-            colp, colq = st.columns(2)
-            with colp:
-                st.markdown(f"**Persona A** — {_person_label(pa, pair['person_id_a'])}")
-                if pa:
-                    st.json(pa)
-            with colq:
-                st.markdown(f"**Persona B** — {_person_label(pb, pair['person_id_b'])}")
-                if pb:
-                    st.json(pb)
+            # Compact list of members, then full detail in columns.
+            for m in group["members"]:
+                st.write("• " + _member_label(m))
+
+            st.markdown("**Detalle de cada persona**")
+            cols = st.columns(min(len(group["members"]), 3))
+            for i, m in enumerate(group["members"]):
+                with cols[i % len(cols)]:
+                    st.caption(_member_label(m))
+                    detail = api_get(f"/persons/{m['person_id']}")
+                    if detail:
+                        st.json(detail)
