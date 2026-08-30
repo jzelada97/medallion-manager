@@ -148,6 +148,7 @@ _BUILD_NAMES_SQL = text(
     CREATE TEMP TABLE _recon_names AS
         SELECT norm,
                words,
+               words[1] AS key1,
                (words[1] || ' ' || words[2]) AS key2,
                n_persons, anchor_id, city, company
         FROM (
@@ -166,6 +167,7 @@ _BUILD_NAMES_SQL = text(
 _INDEX_NAMES_SQL = text(
     "CREATE INDEX _recon_names_trgm ON _recon_names USING gin (norm gin_trgm_ops);"
     " CREATE INDEX _recon_names_norm ON _recon_names (norm);"
+    " CREATE INDEX _recon_names_key1 ON _recon_names (key1);"
     " CREATE INDEX _recon_names_key2 ON _recon_names (key2);"
     " CREATE INDEX _recon_pn_norm ON _recon_pn (norm);"
     " ANALYZE _recon_names;"
@@ -176,9 +178,10 @@ _INDEX_NAMES_SQL = text(
 # Phase 2 — link distinct names via TWO rules, each with its OWN efficient blocking,
 # then group by canonical anchor and propagate to persons.
 #
-#   RULE 1 — TYPO (trigram similarity >= :threshold). Blocking = the `%` operator at a
-#   STRICT session threshold, fully index-backed by the GIN trigram index. Catches
-#   "jean leclerc" vs "jean leclercq".
+#   RULE 1 — TYPO (trigram similarity >= :threshold). Blocking = SAME FIRST WORD (given
+#   name, which a surname typo doesn't change), so the trigram `%` only runs within one
+#   given name instead of scanning the whole index per name — the key speedup on 2M+ rows.
+#   Catches "jean leclerc" vs "jean leclercq".
 #
 #   RULE 2 — CONTAINMENT (every word of one name is in the other). Blocking = share a
 #   whole word (equi-join on the token table), then the `<@` array test. Catches
@@ -192,12 +195,16 @@ _INDEX_NAMES_SQL = text(
 _DETECT_SQL = text(
     """
     WITH typo_pairs AS (
-        -- rule 1: index-backed trigram similarity (strict threshold)
+        -- rule 1: typo/letter-swap. Blocking = SAME FIRST WORD (given name), which a
+        -- surname typo never changes; this restricts the trigram work to within one given
+        -- name instead of scanning the whole GIN index per name. Then the index-backed
+        -- `%` + strict similarity make the decision. Catches "jean leclerc"/"jean leclercq".
         SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, FALSE AS contain
         FROM _recon_names n
         JOIN _recon_names m
-          ON n.norm <> m.norm
-         AND m.norm % n.norm
+          ON n.key1 = m.key1                 -- blocking: same given name
+         AND n.norm <> m.norm
+         AND m.norm % n.norm                 -- index-backed trigram candidate
          AND similarity(n.norm, m.norm) >= :threshold
     ),
     contain_pairs AS (
