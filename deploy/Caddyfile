@@ -7,7 +7,12 @@
 	encode gzip
 
 	# Grafana (optional) under /grafana.
-	handle_path /grafana/* {
+	# Use `handle` (not `handle_path`) so the /grafana prefix is preserved when
+	# proxied. Grafana runs with GF_SERVER_SERVE_FROM_SUB_PATH=true and a root_url
+	# ending in /grafana/, so it expects to keep the prefix. Stripping it (as
+	# handle_path does) makes Grafana redirect back to /grafana/, causing an
+	# infinite redirect loop (ERR_TOO_MANY_REDIRECTS).
+	handle /grafana/* {
 		reverse_proxy grafana:3000
 	}
 

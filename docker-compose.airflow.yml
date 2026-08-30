@@ -19,7 +19,8 @@ x-airflow-common: &airflow-common
   image: apache/airflow:3.3.1
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://hr_user:changeme@postgres:5432/airflow
+    # Credentials come from the .env (Docker Compose auto-loads it). No secrets in the repo.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-hr_user}:${POSTGRES_PASSWORD:-changeme}@postgres:5432/airflow
     # Airflow 3 tasks (Task SDK) call back to the api-server's Task Execution API over
     # HTTP. In this multi-container setup that server is the `airflow-api-server`
     # service, not localhost — without this the workers get "Connection refused".
@@ -41,16 +42,18 @@ x-airflow-common: &airflow-common
     # Make the hr_etl package importable by the DAG BashOperators.
     PYTHONPATH: /opt/airflow/src
     # ETL config so the CLIs connect to the same infra as the main stack.
+    # All credentials are read from the .env (auto-loaded by Compose) so no secrets
+    # are committed. Non-secret hosts/ports keep sensible defaults.
     POSTGRES_HOST: postgres
     POSTGRES_PORT: "5432"
-    POSTGRES_DB: hr_warehouse
-    POSTGRES_USER: hr_user
-    POSTGRES_PASSWORD: changeme
-    MONGO_URI: mongodb://hr_user:changeme@mongo:27017/
+    POSTGRES_DB: ${POSTGRES_DB:-hr_warehouse}
+    POSTGRES_USER: ${POSTGRES_USER:-hr_user}
+    POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    MONGO_URI: ${MONGO_URI:-mongodb://hr_user:changeme@mongo:27017/}
     REDIS_HOST: redis
     REDIS_PORT: "6379"
-    REDIS_PASSWORD: changeme
-    LOG_LEVEL: INFO
+    REDIS_PASSWORD: ${REDIS_PASSWORD:-changeme}
+    LOG_LEVEL: ${LOG_LEVEL:-INFO}
   volumes:
     - ./airflow/dags:/opt/airflow/dags:ro
     - ./src:/opt/airflow/src:ro
@@ -72,11 +75,11 @@ services:
         python -c "import psycopg2, time
         while True:
             try:
-                psycopg2.connect(host='postgres', user='hr_user', password='changeme', dbname='hr_warehouse').close(); break
+                psycopg2.connect(host='postgres', user='${POSTGRES_USER:-hr_user}', password='${POSTGRES_PASSWORD:-changeme}', dbname='${POSTGRES_DB:-hr_warehouse}').close(); break
             except Exception as e:
                 print('waiting for postgres...', e); time.sleep(3)"
         python -c "import psycopg2
-        c = psycopg2.connect(host='postgres', user='hr_user', password='changeme', dbname='hr_warehouse'); c.autocommit=True
+        c = psycopg2.connect(host='postgres', user='${POSTGRES_USER:-hr_user}', password='${POSTGRES_PASSWORD:-changeme}', dbname='${POSTGRES_DB:-hr_warehouse}'); c.autocommit=True
         cur=c.cursor(); cur.execute(\"SELECT 1 FROM pg_database WHERE datname='airflow'\")
         if not cur.fetchone(): cur.execute('CREATE DATABASE airflow'); print('created airflow db')
         else: print('airflow db exists')"
@@ -134,4 +137,7 @@ volumes:
 networks:
   hr_net:
     external: true
-    name: proyecto1_modulo3_de2_hr_net
+    # The main stack creates this network as <compose-project>_hr_net. The project name
+    # defaults to the repo folder name, so it differs per checkout (e.g. hr-etl_hr_net
+    # on the VM, proyecto1_modulo3_de2_hr_net locally). Override via HR_NET_NAME in .env.
+    name: ${HR_NET_NAME:-proyecto1_modulo3_de2_hr_net}
