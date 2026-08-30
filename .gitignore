@@ -21,6 +21,13 @@ htmlcov/
 *.env
 !.env.example
 
+# SSH deploy keys (private + public) — never commit
+deploy_key
+deploy_key.pub
+*.pem
+id_ed25519*
+id_rsa*
+
 # Local-only notes / roadmap (NOT for the repo, personal working notes)
 ROADMAP.local.md
 *.local.md
