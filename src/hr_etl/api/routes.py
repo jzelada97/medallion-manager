@@ -33,8 +33,13 @@ def _row_to_dict(row: PersonRow) -> dict:
     }
 
 
-def build_router(session_factory) -> APIRouter:
-    """Build the API router bound to a SQLAlchemy session factory."""
+def build_router(session_factory, mongo_count=None) -> APIRouter:
+    """Build the API router bound to a SQLAlchemy session factory.
+
+    ``mongo_count`` (optional): a zero-arg callable returning the number of raw
+    documents in the Bronze layer (MongoDB). Injected so the API stays decoupled
+    from Mongo and testable. If not provided, the Bronze count is reported as None.
+    """
     router = APIRouter()
 
     @router.get("/health")
@@ -216,5 +221,54 @@ def build_router(session_factory) -> APIRouter:
             }
         finally:
             session.close()
+
+    @router.get("/medallion")
+    def medallion() -> dict:
+        """Medallion architecture overview: counts for each layer.
+
+        - Bronze: raw messages in the MongoDB data lake.
+        - Silver: consolidated/cleaned persons in Postgres.
+        - Gold: pre-computed aggregates (from gold_stats).
+        """
+        session = session_factory()
+        try:
+            silver = session.execute(select(func.count()).select_from(PersonRow)).scalar_one()
+            gold_row = session.execute(
+                text(
+                    "SELECT total_persons, cross_linked, avg_completeness FROM gold_stats WHERE id = 1"
+                )
+            ).fetchone()
+        finally:
+            session.close()
+
+        # Bronze lives in Mongo; the API is decoupled from it. If the count fails
+        # (Mongo down, not configured), report None rather than crashing the endpoint.
+        bronze: int | None = None
+        if mongo_count is not None:
+            try:
+                bronze = int(mongo_count())
+            except Exception:  # noqa: BLE001 - Bronze is best-effort for the dashboard
+                bronze = None
+
+        return {
+            "bronze": {
+                "store": "MongoDB",
+                "name": "raw messages",
+                "count": bronze,
+            },
+            "silver": {
+                "store": "PostgreSQL",
+                "name": "consolidated persons",
+                "count": silver,
+            },
+            "gold": {
+                "store": "PostgreSQL",
+                "name": "aggregates",
+                "refreshed": gold_row is not None,
+                "total_persons": gold_row.total_persons if gold_row else None,
+                "cross_linked": gold_row.cross_linked if gold_row else None,
+                "avg_completeness": (round(gold_row.avg_completeness, 2) if gold_row else None),
+            },
+        }
 
     return router

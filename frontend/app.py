@@ -81,7 +81,75 @@ st.divider()
 # --------------------------------------------------------------------------- #
 # Tabs: Personas | Duplicados
 # --------------------------------------------------------------------------- #
-tab_persons, tab_dupes = st.tabs(["👤 Personas", "🔗 Duplicados"])
+tab_medallion, tab_persons, tab_dupes = st.tabs(["🏅 Arquitectura", "👤 Personas", "🔗 Duplicados"])
+
+
+# --------------------------------------------------------------------------- #
+# Tab 0: Medallion architecture (Bronze -> Silver -> Gold, live counts)
+# --------------------------------------------------------------------------- #
+def _fmt(n) -> str:
+    """Thousands-separated count, or a dash when unavailable."""
+    return f"{int(n):,}".replace(",", ".") if n is not None else "—"
+
+
+with tab_medallion:
+    st.subheader("Arquitectura Medallion")
+    st.caption(
+        "Flujo de datos por capas. Cada mensaje crudo (Bronze) se consolida y limpia "
+        "en registros de persona (Silver), y de ahí se agregan métricas (Gold)."
+    )
+
+    med = api_get("/medallion") or {}
+    bronze = med.get("bronze", {})
+    silver = med.get("silver", {})
+    gold = med.get("gold", {})
+
+    b_col, arrow1, s_col, arrow2, g_col = st.columns([3, 1, 3, 1, 3])
+    with b_col:
+        st.markdown("### 🥉 Bronze")
+        st.metric("Mensajes crudos", _fmt(bronze.get("count")))
+        st.caption(f"{bronze.get('store', 'MongoDB')} · data lake")
+    with arrow1:
+        st.markdown(
+            "<div style='text-align:center;font-size:2rem;padding-top:2.2rem'>➜</div>",
+            unsafe_allow_html=True,
+        )
+    with s_col:
+        st.markdown("### 🥈 Silver")
+        st.metric("Personas consolidadas", _fmt(silver.get("count")))
+        st.caption(f"{silver.get('store', 'PostgreSQL')} · limpio y unido")
+    with arrow2:
+        st.markdown(
+            "<div style='text-align:center;font-size:2rem;padding-top:2.2rem'>➜</div>",
+            unsafe_allow_html=True,
+        )
+    with g_col:
+        st.markdown("### 🥇 Gold")
+        if gold.get("refreshed"):
+            st.metric("Personas (agregado)", _fmt(gold.get("total_persons")))
+            st.caption(
+                f"{gold.get('store', 'PostgreSQL')} · "
+                f"{_fmt(gold.get('cross_linked'))} cross-linked · "
+                f"completitud {gold.get('avg_completeness', '—')}/8"
+            )
+        else:
+            st.metric("Personas (agregado)", "—")
+            st.caption("Gold sin refrescar todavía")
+
+    # Bronze -> Silver funnel: how much raw collapses into consolidated persons.
+    if bronze.get("count") and silver.get("count"):
+        ratio = bronze["count"] / max(silver["count"], 1)
+        st.info(
+            f"Cada persona consolidada proviene de ~{ratio:.1f} mensajes crudos "
+            f"({_fmt(bronze['count'])} Bronze → {_fmt(silver['count'])} Silver)."
+        )
+
+    if not gold.get("refreshed"):
+        st.warning(
+            "La capa Gold aún no se ha refrescado. Se actualiza con el DAG "
+            "`hr_etl_gold_eventdriven` de Airflow o ejecutando "
+            "`python -m hr_etl.warehouse.gold_layer`."
+        )
 
 
 # --------------------------------------------------------------------------- #
