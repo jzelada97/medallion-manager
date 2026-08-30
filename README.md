@@ -101,6 +101,11 @@ Docker Compose.
 
 ### Por que esta arquitectura
 
+- **Medallion (Bronze / Silver / Gold)**: los datos fluyen por capas de calidad creciente.
+  - **Bronze**: mensajes crudos en MongoDB (inmutable, auditoria, reprocesamiento).
+  - **Silver**: registros de persona consolidados y limpios en PostgreSQL (tabla `persons`).
+  - **Gold**: agregados precomputados en PostgreSQL (`gold_stats`, `gold_top_cities`,
+    `gold_top_companies`, `gold_completeness`) refrescados por un DAG de Airflow.
 - **Lambda-lite**: guardamos el dato crudo en MongoDB (immutable, auditoria, reprocesamiento)
   y el dato procesado en PostgreSQL (consultas, JOIN, indices, ACID).
 - **Desacoplamiento via Redis**: el buffer permite que la ingesta sea rapida sin esperar a la
@@ -198,18 +203,25 @@ Proyecto1_modulo3_DE2/
 │   ├── consumer/               # Kafka consumer (confluent-kafka)
 │   ├── lake/                   # MongoDB writer (batch + individual)
 │   ├── processing/             # Detector, normalizer, matcher, consolidator
-│   ├── warehouse/              # PostgreSQL writer (upsert ON CONFLICT)
+│   ├── warehouse/              # PostgreSQL writer (upsert) + gold_layer (agregados)
 │   ├── cache/                  # Redis buffer (fragmentos por persona)
 │   ├── metrics/                # Prometheus counters/histograms/gauges
-│   ├── models/                 # Pydantic (Person) + SQLAlchemy (PersonRow)
+│   ├── models/                 # Pydantic (Person) + SQLAlchemy (PersonRow, MatchCandidate)
+│   ├── processing/reconcile.py # Reconciliacion batch (candidatos a duplicado)
+│   ├── airflow_ext/            # Sensor deferrable para el DAG event-driven
 │   └── api/                    # FastAPI endpoints
-├── frontend/                   # Streamlit dashboard
+├── frontend/                   # Streamlit dashboard (Arquitectura, Personas, Duplicados)
+├── airflow/dags/               # DAGs: refresh Gold (event-driven) + reconciliacion
 ├── tests/                      # pytest (unit + integracion)
 ├── docker/                     # Dockerfiles (app, api, frontend)
-├── monitoring/                 # prometheus.yml
+├── deploy/                     # setup-oracle-vm.sh, deploy.sh, Caddyfile
+├── monitoring/                 # prometheus.yml + dashboards de Grafana
 ├── data-generator/             # Submodule: generador Kafka (caja negra)
 ├── docker-compose.yml          # Stack completo
+├── docker-compose.prod.yml     # Overlay de produccion (Caddy, sin puertos de BD)
 ├── docker-compose.override.yml # Puertos de BD expuestos (solo local)
+├── docker-compose.airflow.yml  # Airflow 3 (opt-in)
+├── .github/workflows/CICD.yml  # CI/CD (lint + tests + deploy por SSH)
 ├── pyproject.toml              # Build + dependencias
 ├── .env.example                # Variables de entorno (template)
 └── sonar-project.properties    # Config SonarQube
@@ -429,7 +441,11 @@ Base URL: `http://localhost:8000`
 | `/metrics` | GET | Metricas Prometheus (texto) |
 | `/persons` | GET | Listado con paginacion y busqueda |
 | `/persons/{id}` | GET | Detalle de una persona (404 si no existe) |
-| `/stats` | GET | Estadisticas agregadas |
+| `/stats` | GET | Estadisticas agregadas (Silver, en vivo) |
+| `/candidates` | GET | Posibles duplicados de la reconciliacion (`min_confidence`, `limit`) |
+| `/gold/stats` | GET | Estadisticas precomputadas (capa Gold) |
+| `/gold/completeness` | GET | Distribucion de completitud de campos (Gold) |
+| `/medallion` | GET | Conteos de las 3 capas Bronze/Silver/Gold para el dashboard |
 
 ### Parametros de `/persons`
 
@@ -469,13 +485,17 @@ Base URL: `http://localhost:8000`
 
 ## Frontend (Streamlit)
 
-Dashboard interactivo en http://localhost:8501 con:
+Dashboard interactivo en http://localhost:8501 con tres pestañas:
 
-- Tarjetas de metricas (total personas, con banco, top ciudad)
-- Graficos de barras (top ciudades, top empresas) usando los datos de `/stats`
-- Buscador con filtros (nombre, ciudad, empresa)
-- Tabla de resultados con paginacion
-- Ficha de detalle al seleccionar una persona
+- **🏅 Arquitectura**: vista Medallion en vivo (Bronze → Silver → Gold) con los conteos
+  de cada capa y el ratio de mensajes crudos por persona consolidada.
+- **👤 Personas**: buscador con filtros (nombre, ciudad, empresa, puesto), selector de
+  tamaño de página (25–500), paginación con botones Anterior/Siguiente, tabla de
+  resultados y ficha de detalle al seleccionar una persona. Arriba, tarjetas de métricas
+  y gráficos de barras (top ciudades, top empresas) desde `/stats`.
+- **🔗 Duplicados**: candidatos a duplicado de la reconciliación (`/candidates`) con la
+  confianza como barra de progreso, filtro por confianza mínima y comparación lado a
+  lado de las dos personas de cada par.
 
 ---
 
@@ -580,17 +600,26 @@ completo. Las principales:
 4. **Fragmentos Net**: El fragmento Net (address + IPv4) raramente se une a otros porque depende
    de un match exacto de address, que pocas veces coincide.
 
+### Ya implementado (nivel Experto)
+
+- **Reconciliacion batch**: job periodico (`hr_etl_reconciliation` en Airflow) que cruza
+  registros y guarda candidatos a duplicado en `match_candidates` (ver seccion de matching).
+- **Capa Gold + Medallion**: agregados precomputados refrescados por Airflow, expuestos por
+  la API (`/gold/*`, `/medallion`) y visualizados en la pestaña Arquitectura del frontend.
+- **Orquestacion con Airflow 3**: DAG event-driven con sensor deferrable que refresca Gold
+  cuando entran suficientes personas nuevas (o cada 15 min como fallback).
+- **CI/CD**: workflow unico que corre lint + tests y, si pasan en `main`, despliega por SSH
+  a la VM de Oracle.
+
 ### Mejoras futuras
 
-1. **Reconciliacion batch**: Segundo paso periodico que cruce registros por passport con registros
-   por nombre usando similitud de texto (no en streaming, sino como job separado).
-
-2. **Normalizacion de valores persistidos**: Colapsar dobles espacios tambien en los valores
+1. **Normalizacion de valores persistidos**: Colapsar dobles espacios tambien en los valores
    que se guardan en Postgres, no solo en las keys de matching.
 
-3. **Metricas de calidad**: Dashboard con ratio de campos rellenos, fragmentos huerfanos, etc.
+2. **Backpressure**: Si Redis se llena, reducir velocidad de consumo (consumer pause/resume).
 
-4. **Backpressure**: Si Redis se llena, reducir velocidad de consumo (consumer pause/resume).
+3. **Matching por similitud difusa**: complementar el match por prefijo de la reconciliacion
+   con distancia de edicion (Levenshtein) para nombres con erratas.
 
 ---
 
@@ -618,18 +647,30 @@ Proyecto educativo del Bootcamp de Ingenieria de Datos (Factoria F5 Madrid).
 
 ## CI/CD y despliegue
 
-### Integración continua (GitHub Actions)
+### CI/CD (GitHub Actions)
 
-En cada push/PR a `main` o `dev` se ejecuta `.github/workflows/ci.yml`:
+Un unico workflow (`.github/workflows/CICD.yml`, nombre visible **CI/CD**) cubre
+integracion y despliegue:
 
 - **Job `unit`**: levanta Postgres/Mongo/Redis como *service containers*, instala el
   paquete con extras `dev,frontend`, y corre `ruff`, `black --check` y `pytest` con
-  cobertura (los 112 tests). Sube `coverage.xml` como artefacto.
+  cobertura. Sube `coverage.xml` como artefacto.
 - **Job `airflow`**: levanta el stack de Airflow y ejecuta los tests del sensor
   deferrable dentro del contenedor (`scripts/run-airflow-tests.sh`).
+- **Job `deploy`**: solo en **push a `main`** y solo si `unit` pasa. Entra por SSH a la
+  VM de Oracle y ejecuta `deploy/deploy.sh` (pull de `main` + rebuild/restart del stack
+  principal). Requiere los secrets `VM_HOST`, `VM_USER`, `VM_SSH_KEY`.
 
 ### Despliegue
 
-Pensado para una **VM del Always Free de Oracle Cloud**: overlay de producción
-`docker-compose.prod.yml` + `deploy/Caddyfile` (HTTPS automático con Caddy, bases de
-datos no expuestas al exterior) y script de arranque `deploy/setup-oracle-vm.sh`.
+Pensado para una **VM del Always Free de Oracle Cloud**:
+
+- Overlay de producción `docker-compose.prod.yml` + `deploy/Caddyfile`: Caddy termina
+  HTTPS automáticamente (Let's Encrypt) y hace de reverse proxy; las bases de datos no se
+  exponen al exterior (solo Caddy publica 80/443).
+- Script de arranque inicial `deploy/setup-oracle-vm.sh` (instala Docker, abre el
+  firewall, clona y levanta el stack).
+- Script de redeploy idempotente `deploy/deploy.sh` (usado por el CD y también a mano).
+- **Airflow** se despliega aparte con `docker-compose.airflow.yml` (opt-in). Sus
+  credenciales y el nombre de red se leen del `.env` (sin secretos en el repo). Los DAGs
+  van montados por volumen, así que un `git pull` los actualiza sin reiniciar Airflow.
