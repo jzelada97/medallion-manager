@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD
 
 on:
   push:
@@ -134,7 +134,10 @@ jobs:
   deploy:
     name: Deploy to Oracle VM
     runs-on: ubuntu-latest
-    needs: [unit, airflow]
+    # Only gate on `unit` (the main-stack tests). The `airflow` job validates DAGs in
+    # parallel but must not block deploys: the deploy touches only the main stack, not
+    # the VM's Airflow, so a flaky Airflow-CI job shouldn't stop a good deployment.
+    needs: [unit]
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     steps:
       - name: Deploy over SSH
