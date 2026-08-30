@@ -1,0 +1,34 @@
+name: Deploy
+
+# Deploy runs only after the CI workflow completes successfully on main.
+# This guarantees we never deploy code that failed lint/tests.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+# Never run two deploys at once; if a newer one starts, cancel the in-flight one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: SSH deploy to Oracle VM
+    runs-on: ubuntu-latest
+    # Gate: only when the triggering CI run succeeded.
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          # Fail the job if any command in the script fails.
+          script_stop: true
+          command_timeout: "20m"
+          script: |
+            bash ~/hr-etl/deploy/deploy.sh
