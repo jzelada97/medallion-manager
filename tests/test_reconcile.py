@@ -106,6 +106,30 @@ def test_fuzzy_groups_typo_surname(pg_session_factory):
         session.close()
 
 
+def test_containment_extra_surname_groups(pg_session_factory):
+    """A shorter name fully contained in a longer one is a match, even below threshold.
+
+    "octavio ponce" ⊆ "octavio ponce gimenez": trigram similarity is < 0.85, so only the
+    word-containment rule links them. This must hold at the strict default threshold.
+    """
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "passport:X1", "octavio ponce")
+        b = _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez")
+        session.commit()
+
+        # default strict threshold (0.85): only containment can link these
+        n = run_reconciliation(session)
+
+        assert n >= 2
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
+        reasons = {m.reason for m in session.query(DuplicateGroup).all()}
+        assert "name_containment" in reasons
+    finally:
+        session.close()
+
+
 def test_group_anchored_to_min_id(pg_session_factory):
     session = pg_session_factory()
     try:

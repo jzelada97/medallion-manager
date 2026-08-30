@@ -316,13 +316,28 @@ Para abordar los casos ambiguos donde el matching en streaming no puede decidir,
   `persons` en memoria de Python y agrupaba con diccionarios; con millones de filas eso
   agota la RAM (llego a tumbar la VM de demo). Ahora la deteccion (normalizacion,
   similitud, agrupacion) corre dentro de Postgres y solo vuelven las filas de pertenencia.
-- **Similitud difusa con `pg_trgm`.** El match exacto no detecta duplicados reales como
-  "leclerc" vs "leclercq" (una letra) o "martinez" vs "martenez" (letra cambiada). La
-  extension `pg_trgm` puntua similitud de cadenas (0..1) con indice, asi que los captura
-  a escala. Umbral estricto (0.85) para pocos falsos positivos.
-- **Blocking por primera palabra del nombre.** Comparar todos contra todos es O(n^2). Solo
-  se comparan nombres que comparten su primera palabra (mismo nombre de pila), tecnica
-  estandar de *blocking* en entity resolution.
+- **Dos fases: exacto primero, difuso solo sobre nombres DISTINTOS.** El coste esta en la
+  comparacion difusa, pero la mayoria de duplicados son el mismo nombre repetido (no
+  necesita difuso). Por eso: (1) se colapsan las personas a un catalogo de nombres
+  normalizados distintos (un `GROUP BY`, reduce millones de filas a muchos menos nombres);
+  (2) el difuso corre SOLO entre esos nombres distintos; (3) cada persona hereda el grupo
+  de su nombre. Asi el paso caro nunca ve nombres repetidos y no explota.
+- **Sin limites de resultado.** No hay maximo de miembros por grupo ni `LIMIT` de filas
+  escritas: capar resultados descartaria duplicados reales al crecer el dataset. El diseño
+  es barato de por si; queda un `statement_timeout` SOLO como salvavidas anti-cuelgue (si
+  saltara, cancela toda la pasada y no escribe nada — nunca un resultado parcial).
+- **Normalizacion: quita titulos en AMBOS lados.** Honorificos y sufijos (Mr, Dr, MD,
+  PhD, Jr...) pueden venir antes o despues del nombre; se quitan de los dos extremos (misma
+  lista que el `normalizer` del streaming) para que "Dr Juan Perez", "Juan Perez MD" y
+  "Juan Perez" normalicen igual.
+- **Dos reglas de match** (sin bajar el umbral para todos):
+  - *Typo/letra cambiada* — similitud `pg_trgm` >= 0.85 (indice GIN). Detecta "leclerc"
+    vs "leclercq", "martinez" vs "martenez".
+  - *Contencion de palabras* — todas las palabras de un nombre estan en el otro. Detecta
+    "octavio ponce" ⊆ "octavio ponce gimenez" (apellido extra), caso que la similitud
+    difusa por si sola dejaria por debajo de 0.85. Cada regla tiene su propio *blocking*
+    eficiente (trigramas para typo; nombre+primer apellido para contencion), asi no se
+    comparan todos contra todos.
 - **Grupos, no pares** (tabla `duplicate_groups`): varios registros de la misma persona
   comparten `group_id` (el id minimo del grupo, ancla canonica). Una fila por miembro.
 - **Agrupacion por ancla, NO clustering de componentes conexos.** Convertir pares en
@@ -631,8 +646,9 @@ completo. Las principales:
 
 2. **Backpressure**: Si Redis se llena, reducir velocidad de consumo (consumer pause/resume).
 
-3. **Matching por similitud difusa**: complementar el match por prefijo de la reconciliacion
-   con distancia de edicion (Levenshtein) para nombres con erratas.
+3. **Reconciliacion incremental**: hoy es un rebuild completo cada pasada (siempre
+   correcto, y barato gracias al colapso a nombres distintos). Con volumenes mucho mayores
+   se podria procesar solo las personas nuevas desde la ultima corrida.
 
 ---
 

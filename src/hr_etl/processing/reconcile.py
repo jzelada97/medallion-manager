@@ -11,17 +11,34 @@ Design decisions (read this — it explains the trade-offs):
   — normalization, fuzzy matching, grouping — happens inside Postgres; only the final
   membership rows come back.
 
-* **Fuzzy name matching with ``pg_trgm``.** Exact-name matching misses real duplicates
-  like "leclerc" vs "leclercq" (one letter) or "martinez" vs "martenez" (letter swap).
-  The ``pg_trgm`` extension scores string similarity (0..1) and is index-backed, so we
-  can catch these at scale. Threshold ``_SIMILARITY_THRESHOLD`` (0.85) is strict to
-  keep false positives low.
+* **Two phases: exact first, fuzzy only over DISTINCT names.** The expensive part is
+  fuzzy comparison. But most duplicates are the *same* normalized name repeated many
+  times, which needs no fuzzy work at all. So:
+    1. Collapse persons to a catalog of DISTINCT normalized names (``_recon_names``).
+       This is one cheap ``GROUP BY`` and shrinks millions of rows to far fewer names.
+    2. Run fuzzy matching (``pg_trgm``) ONLY between those distinct names — a much
+       smaller set — to link typo variants like "leclerc" vs "leclercq".
+    3. Assign every distinct name a ``group_id`` (canonical anchor) and propagate it
+       back to all persons carrying that name.
+  This removes the pathological cost of comparing millions of near-identical rows: the
+  fuzzy step never sees duplicate names, so there is no cluster of identical strings to
+  blow it up.
 
-* **Blocking by first name word.** Comparing every name against every other is O(n^2)
-  and unfeasible on millions of rows. We only compare names that share their first word
-  (``split_part(norm,' ',1)``), which is cheap to filter and captures the realistic
-  cases (same given name, surname typo/extra surname). This is the standard "blocking"
-  technique in entity resolution.
+* **No result caps.** There is no maximum number of members per group and no LIMIT on
+  how many memberships are written. Capping results would silently drop real duplicates
+  once the dataset grows, which is wrong. The design is cheap enough to run unbounded;
+  a ``statement_timeout`` remains ONLY as an anti-hang safety net (if it ever fires the
+  whole run is cancelled and writes nothing — it never writes a partial/incorrect set).
+
+* **Fuzzy name matching with ``pg_trgm``.** Exact matching misses "leclerc" vs
+  "leclercq" (one letter) or "martinez" vs "martenez" (swap). ``pg_trgm`` scores string
+  similarity (0..1), index-backed. Threshold ``_SIMILARITY_THRESHOLD`` (0.85) is strict
+  to keep false positives low.
+
+* **Title stripping on both ends.** Honorifics/suffixes (Mr, Dr, MD, PhD, Jr...) can
+  appear before OR after the name in the generator's data. They are stripped from both
+  ends (same list as the streaming ``normalizer``) so "Dr Juan Perez", "Juan Perez MD"
+  and "Juan Perez" normalize to the same name.
 
 * **Grouping by a canonical anchor, NOT full connected-components clustering.**
   Similarity gives us pairs (A~B, B~C). Turning pairs into true groups means finding
@@ -34,12 +51,12 @@ Design decisions (read this — it explains the trade-offs):
     - **Recursive CTE**: the SQL-native way to walk the graph, but recursive CTEs over
       large, densely-connected data can blow up in time and memory (again risky for the
       small VM).
-  We deliberately DON'T implement either. Instead each person's group is anchored to
-  the smallest person id among itself and its direct similars. For person-name data,
-  similarity is effectively mutual within a block (if A~B and B~C then usually A~C too),
-  so anchoring yields correct groups in the vast majority of cases without the cost and
-  risk of connected-components. If perfect transitive clustering is ever required, a
-  recursive CTE would be the place to add it — see the note at the bottom.
+  We deliberately DON'T implement either. Instead each distinct name's group is anchored
+  to the smallest person id among itself and its direct similars. For person-name data,
+  similarity is effectively mutual (if A~B and B~C then usually A~C too), so anchoring
+  yields correct groups in the vast majority of cases without the cost and risk of
+  connected-components. If perfect transitive clustering is ever required, a recursive
+  CTE would be the place to add it — see the note at the bottom.
 
 Run: python -m hr_etl.processing.reconcile
 """
@@ -56,76 +73,190 @@ from hr_etl.models.db_models import DuplicateGroup
 logger = get_logger(__name__)
 
 # Fuzzy-name similarity threshold (0..1). Strict on purpose: fewer false positives.
+# Used both as the `%` session threshold (rule-1 blocking) AND the decision cutoff.
 _SIMILARITY_THRESHOLD = 0.85
 
-# Safety cap so a pathological dataset can never flood the table or memory.
-_MAX_MEMBERSHIPS = 20000
 
-# Abort the query if it runs too long, so reconciliation can never hang the DB/VM.
-_STATEMENT_TIMEOUT_MS = 120_000  # 2 minutes
+# Abort the query if it runs too long, so reconciliation can never hang the DB/VM. This
+# is an anti-hang safety net ONLY, not a result cap: if it fires, the whole run is
+# cancelled and nothing is written (never a partial/incorrect group set).
+_STATEMENT_TIMEOUT_MS = 600_000  # 10 minutes
 
-# Normalized-name expression computed IN SQL: lowercase, collapse whitespace, trim.
-_NORM = "btrim(regexp_replace(lower(full_name), '\\s+', ' ', 'g'))"
+# Minimum tokens (words) a normalized name must have to be eligible. A single token
+# like "juan" is far too ambiguous to claim a duplicate: thousands of unrelated people
+# share a given name. Requiring name + surname keeps groups meaningful and stops
+# high-frequency first names from forming spurious groups.
+_MIN_NAME_TOKENS = 2
 
-# Core detection query.
+# Titles/honorifics/suffixes to strip, mirrored from processing/normalizer.py so the
+# normalized name here matches the streaming pipeline. IMPORTANT: any of these can appear
+# on EITHER side of the name (the generator puts them as prefix OR suffix, e.g. "Dr Juan
+# Perez" and "Juan Perez MD" both occur). So we use ONE list and strip it from both ends,
+# twice, to also catch a title on both ends. Stripping matters: without it a leading
+# title dominates the name and unrelated people get matched together.
+_TITLES = (
+    r"mr|mrs|ms|miss|sir|dr|dr\(a\)|dott|dott\.ssa|ing|lic|mtro|prof|"
+    r"sr|sra|sr\(a\)|sig|sig\.ra|md|phd|ph\.d|jr|ii|iii|iv|pi|dds|esq"
+)
+_STRIP_PREFIX = rf"^({_TITLES})\.?\s+"  # a leading title + following space
+_STRIP_SUFFIX = rf"\s+({_TITLES})\.?$"  # a trailing space + title
+
+
+def _strip_titles_sql(expr: str) -> str:
+    """Wrap a SQL text expression to strip a leading/trailing title (both ends, twice)."""
+    for pattern in (_STRIP_PREFIX, _STRIP_SUFFIX, _STRIP_PREFIX, _STRIP_SUFFIX):
+        expr = f"btrim(regexp_replace({expr}, '{pattern}', '', 'i'))"
+    return expr
+
+
+# Normalized-name expression computed IN SQL: lowercase, collapse whitespace, strip
+# titles from both ends, trim. Mirrors normalizer.strip_titles + normalize_text.
+_NORM = _strip_titles_sql("btrim(regexp_replace(lower(full_name), '\\s+', ' ', 'g'))")
+
+# ---------------------------------------------------------------------------
+# Phase 1 — build a catalog of DISTINCT eligible names.
 #
-# Step by step:
-#   normed  : persons with a usable normalized name + its first word (the "block").
-#   pairs   : self-join within the SAME block where fuzzy similarity >= threshold and
-#             a.id <> b.id. This is the O(n^2)-within-block comparison, kept cheap by
-#             the block filter and the trigram index.
-#   anchored: for every person that appears in a pair, its group_id = the smallest id
-#             among itself and all its similars (the canonical anchor). We also keep the
-#             best (max) similarity as the member's confidence and whether a corroborating
-#             field (city/company) matched, to enrich the reason.
-#
-# Only persons that actually have at least one similar peer end up in a group.
-_DETECT_SQL = text(
+# For each distinct normalized name we keep the smallest person id (anchor_id), plus one
+# representative city/company (for the reason label). Collapsing to distinct names is the
+# single most important optimization: it turns "millions of rows, many identical" into
+# "a smaller set of unique names", so the fuzzy step never wastes work on repeated names.
+# ---------------------------------------------------------------------------
+# First materialize (person id -> normalized name) ONCE, so the expensive title-strip
+# regex runs a single time per row (not again when we join persons back at the end).
+_BUILD_PN_SQL = text(
     f"""
-    SET LOCAL statement_timeout = {_STATEMENT_TIMEOUT_MS};
+    DROP TABLE IF EXISTS _recon_pn;
+    CREATE TEMP TABLE _recon_pn AS
+        SELECT id, norm, city, company
+        FROM (
+            SELECT id, {_NORM} AS norm, city, company
+            FROM persons
+            WHERE full_name IS NOT NULL
+        ) s
+        WHERE length(norm) >= 3
+          AND array_length(regexp_split_to_array(norm, ' '), 1) >= {_MIN_NAME_TOKENS};
+    """
+)
 
-    WITH normed AS (
-        SELECT id,
-               {_NORM} AS norm,
-               split_part({_NORM}, ' ', 1) AS block,
-               city, company
-        FROM persons
-        WHERE full_name IS NOT NULL AND length({_NORM}) >= 3
+# Each distinct name carries its word array (for the containment subset test) and a
+# `key2` = first two words joined (given name + first surname). key2 is the containment
+# blocking key: it is highly selective yet always shared by a name and its extra-surname
+# variant, so we never build a cartesian block on a common given name.
+_BUILD_NAMES_SQL = text(
+    """
+    DROP TABLE IF EXISTS _recon_names;
+    CREATE TEMP TABLE _recon_names AS
+        SELECT norm,
+               words,
+               (words[1] || ' ' || words[2]) AS key2,
+               n_persons, anchor_id, city, company
+        FROM (
+            SELECT norm,
+                   regexp_split_to_array(norm, ' ') AS words,
+                   count(*) AS n_persons,
+                   min(id) AS anchor_id,
+                   min(city)    FILTER (WHERE city IS NOT NULL)    AS city,
+                   min(company) FILTER (WHERE company IS NOT NULL) AS company
+            FROM _recon_pn
+            GROUP BY norm
+        ) g;
+    """
+)
+
+_INDEX_NAMES_SQL = text(
+    "CREATE INDEX _recon_names_trgm ON _recon_names USING gin (norm gin_trgm_ops);"
+    " CREATE INDEX _recon_names_norm ON _recon_names (norm);"
+    " CREATE INDEX _recon_names_key2 ON _recon_names (key2);"
+    " CREATE INDEX _recon_pn_norm ON _recon_pn (norm);"
+    " ANALYZE _recon_names;"
+    " ANALYZE _recon_pn;"
+)
+
+# ---------------------------------------------------------------------------
+# Phase 2 — link distinct names via TWO rules, each with its OWN efficient blocking,
+# then group by canonical anchor and propagate to persons.
+#
+#   RULE 1 — TYPO (trigram similarity >= :threshold). Blocking = the `%` operator at a
+#   STRICT session threshold, fully index-backed by the GIN trigram index. Catches
+#   "jean leclerc" vs "jean leclercq".
+#
+#   RULE 2 — CONTAINMENT (every word of one name is in the other). Blocking = share a
+#   whole word (equi-join on the token table), then the `<@` array test. Catches
+#   "octavio ponce" ⊆ "octavio ponce gimenez" WITHOUT lowering the similarity threshold.
+#   Trigram similarity would miss this; a low trigram threshold would be far too slow, so
+#   containment gets its own word-based blocking instead.
+#
+# The two candidate-pair sets are UNIONed, self is added (so every name anchors), then a
+# single grouping assigns group_id = smallest anchor_id among linked names. No caps.
+# ---------------------------------------------------------------------------
+_DETECT_SQL = text(
+    """
+    WITH typo_pairs AS (
+        -- rule 1: index-backed trigram similarity (strict threshold)
+        SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, FALSE AS contain
+        FROM _recon_names n
+        JOIN _recon_names m
+          ON n.norm <> m.norm
+         AND m.norm % n.norm
+         AND similarity(n.norm, m.norm) >= :threshold
     ),
-    pairs AS (
-        SELECT a.id AS pid,
-               b.id AS other,
-               similarity(a.norm, b.norm) AS sim,
-               (a.city IS NOT NULL AND a.city = b.city) AS same_city,
-               (a.company IS NOT NULL AND a.company = b.company) AS same_company
-        FROM normed a
-        JOIN normed b
-          ON a.block = b.block          -- blocking: same first name word
-         AND a.id <> b.id
-         AND similarity(a.norm, b.norm) >= :threshold
+    contain_pairs AS (
+        -- rule 2: containment. Blocking key = the first TWO words (given name + first
+        -- surname). Two names can only be in a containment relationship if they agree on
+        -- their leading words, so this key is both correct and far more selective than a
+        -- single shared word (which explodes on common given names). We then confirm with
+        -- the full word-subset test. Only names with a different word count can be a
+        -- proper containment (equal-length would be caught by the typo rule if similar).
+        SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, TRUE AS contain
+        FROM _recon_names n
+        JOIN _recon_names m
+          ON n.key2 = m.key2                 -- blocking: same given name + first surname
+         AND n.norm <> m.norm
+         AND array_length(n.words, 1) <> array_length(m.words, 1)
+         AND (n.words <@ m.words OR m.words <@ n.words)
     ),
-    anchored AS (
-        SELECT pid,
-               LEAST(pid, MIN(other)) AS group_id,
-               MAX(sim) AS confidence,
-               bool_or(same_city) AS any_city,
-               bool_or(same_company) AS any_company
-        FROM pairs
-        GROUP BY pid
+    links AS (
+        SELECT a, b, sim, contain FROM typo_pairs
+        UNION ALL
+        SELECT a, b, sim, contain FROM contain_pairs
+    ),
+    name_groups AS (
+        SELECT nm.norm,
+               nm.anchor_id,
+               nm.n_persons,
+               nm.city,
+               nm.company,
+               LEAST(nm.anchor_id, COALESCE(min(peer.anchor_id), nm.anchor_id)) AS group_id,
+               max(l.sim) AS fuzzy_sim,
+               bool_or(l.contain) AS has_containment_link,
+               count(l.b) > 0 AS has_link
+        FROM _recon_names nm
+        LEFT JOIN links l ON l.a = nm.norm
+        LEFT JOIN _recon_names peer ON peer.norm = l.b
+        GROUP BY nm.norm, nm.anchor_id, nm.n_persons, nm.city, nm.company
+    ),
+    -- a group is "real" (has duplicates) if it holds MORE THAN ONE PERSON in total,
+    -- whether from the same exact name repeated or from linked name variants.
+    real_groups AS (
+        SELECT group_id
+        FROM name_groups
+        GROUP BY group_id
+        HAVING sum(n_persons) > 1
     )
-    SELECT pid AS person_id,
-           group_id,
-           confidence,
+    SELECT p.id AS person_id,
+           g.group_id,
+           COALESCE(g.fuzzy_sim, 1.0) AS confidence,
            CASE
-               WHEN any_city THEN 'fuzzy_name + same city'
-               WHEN any_company THEN 'fuzzy_name + same company'
-               ELSE 'fuzzy_name'
+               WHEN g.has_containment_link THEN 'name_containment'
+               WHEN g.city IS NOT NULL AND g.has_link THEN 'fuzzy_name + same city'
+               WHEN g.company IS NOT NULL AND g.has_link THEN 'fuzzy_name + same company'
+               WHEN g.has_link THEN 'fuzzy_name'
+               ELSE 'exact_name'
            END AS reason
-    FROM anchored
-    -- keep only real groups (group_id differs from pid for at least one member);
-    -- singletons never reach here because they had no qualifying pair.
-    ORDER BY group_id, person_id
-    LIMIT :limit
+    FROM name_groups g
+    JOIN real_groups r ON r.group_id = g.group_id
+    JOIN _recon_pn p ON p.norm = g.norm
+    ORDER BY g.group_id, p.id
     """
 )
 
@@ -151,8 +282,9 @@ def run_reconciliation(
 ) -> int:
     """Full rebuild: clear old groups, detect via SQL, persist memberships.
 
-    Returns the number of group-membership rows written. Memory-safe: the heavy work
-    runs in Postgres and only membership rows are materialized (capped).
+    Returns the number of group-membership rows written. Memory-safe AND scalable: the
+    heavy work runs in Postgres over a catalog of DISTINCT names (not every row), and
+    there is no cap on group size or membership count.
     """
     # Always start clean (full rebuild). If the table doesn't exist yet, init_schema
     # in main() creates it; here we just clear it.
@@ -163,10 +295,19 @@ def run_reconciliation(
         return 0
 
     try:
-        rows = session.execute(
-            _DETECT_SQL,
-            {"threshold": similarity_threshold, "limit": _MAX_MEMBERSHIPS},
-        ).all()
+        # Bound every statement in this run as an anti-hang safety net (not a result cap).
+        session.execute(text(f"SET statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+        # The `%` operator (rule-1 blocking) matches when similarity >= this session
+        # threshold; align it with our strict decision threshold so it stays fast and
+        # precise. SET takes no bind params, so the validated float is inlined.
+        threshold = float(similarity_threshold)
+        session.execute(text(f"SET pg_trgm.similarity_threshold = {threshold}"))
+        # Phase 1: (person -> normalized name) once, distinct-name catalog, token keys.
+        session.execute(_BUILD_PN_SQL)
+        session.execute(_BUILD_NAMES_SQL)
+        session.execute(_INDEX_NAMES_SQL)
+        # Phase 2: link names (typo + containment), group, propagate to persons (no caps).
+        rows = session.execute(_DETECT_SQL, {"threshold": threshold}).all()
     except SQLAlchemyError as exc:
         session.rollback()
         logger.error("reconciliation query failed: %s", exc)
@@ -224,9 +365,9 @@ if __name__ == "__main__":
 # ---------------------------------------------------------------------------
 # NOTE — where full clustering would go (intentionally NOT implemented):
 # If we ever need perfect transitive groups (A~B, B~C  =>  {A,B,C} even when A!~C),
-# replace the `anchored` CTE with a RECURSIVE CTE that walks the `pairs` graph to
-# connected components, or compute Union-Find in a worker. We skipped it because the
-# anchor approach is correct for the vast majority of person-name data and avoids the
-# time/memory cost that a recursive walk (or loading the graph into Python) would add
-# on a small VM. See the module docstring for the full rationale.
+# replace the anchor logic in `name_groups` with a RECURSIVE CTE that walks the fuzzy
+# graph over the DISTINCT names to connected components (cheaper than over all rows), or
+# compute Union-Find in a worker. We skipped it because the anchor approach is correct
+# for the vast majority of person-name data and avoids the time/memory cost of a
+# recursive walk. See the module docstring for the full rationale.
 # ---------------------------------------------------------------------------
