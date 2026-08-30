@@ -151,7 +151,15 @@ with tab_persons:
     if items:
         df = pd.DataFrame(items)
         preferred = [
-            "id", "full_name", "city", "company", "job", "email", "phone", "iban", "salary",
+            "id",
+            "full_name",
+            "city",
+            "company",
+            "job",
+            "email",
+            "phone",
+            "iban",
+            "salary",
         ]
         cols = [c for c in preferred if c in df.columns] + [
             c for c in df.columns if c not in preferred
@@ -171,9 +179,7 @@ with tab_persons:
                 unsafe_allow_html=True,
             )
         with next_col:
-            if st.button(
-                "Siguiente ▶", disabled=(page >= total_pages), use_container_width=True
-            ):
+            if st.button("Siguiente ▶", disabled=(page >= total_pages), use_container_width=True):
                 st.session_state.persons_page = min(total_pages, page + 1)
                 st.rerun()
 
@@ -223,19 +229,18 @@ with tab_dupes:
         step=0.05,
         help="Solo muestra pares cuya confianza de coincidencia supere este umbral.",
     )
-    max_rows = st.number_input(
-        "Máx. resultados", min_value=1, max_value=500, value=100, step=25
-    )
+    max_rows = st.number_input("Máx. resultados", min_value=1, max_value=500, value=100, step=25)
 
-    dupes = api_get(
-        "/candidates", {"limit": int(max_rows), "min_confidence": float(min_conf)}
-    ) or {"total": 0, "count": 0, "items": []}
+    dupes = api_get("/candidates", {"limit": int(max_rows), "min_confidence": float(min_conf)}) or {
+        "total": 0,
+        "count": 0,
+        "items": [],
+    }
     dup_total = dupes.get("total", 0)
     dup_items = dupes.get("items", [])
 
     st.caption(
-        f"{dup_total} candidato(s) por encima de {min_conf:.2f} · "
-        f"mostrando {len(dup_items)}"
+        f"{dup_total} candidato(s) por encima de {min_conf:.2f} · " f"mostrando {len(dup_items)}"
     )
 
     if not dup_items:
@@ -254,7 +259,11 @@ with tab_dupes:
             "confidence": "confianza",
             "reason": "motivo",
         }
-        show_cols = [c for c in ["id", "person_id_a", "person_id_b", "confidence", "reason"] if c in df_dupes.columns]
+        show_cols = [
+            c
+            for c in ["id", "person_id_a", "person_id_b", "confidence", "reason"]
+            if c in df_dupes.columns
+        ]
         st.dataframe(
             df_dupes[show_cols].rename(columns=rename),
             use_container_width=True,
