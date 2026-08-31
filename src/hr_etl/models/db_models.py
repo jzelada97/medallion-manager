@@ -21,6 +21,11 @@ class PersonRow(Base):
     match_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     passport: Mapped[str | None] = mapped_column(String(64), index=True, nullable=True)
     full_name: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
+    # Persisted normalized name (lowercase, no accents, titles stripped from both ends,
+    # whitespace collapsed). Materialized so the reconciliation job never recomputes the
+    # heavy regex over millions of rows; kept in sync by the warehouse writer + a one-off
+    # backfill. Indexed (btree + GIN trigram) for the fuzzy-name reconciliation.
+    norm_name: Mapped[str | None] = mapped_column(String(255), index=True, nullable=True)
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lastname: Mapped[str | None] = mapped_column(String(128), nullable=True)
     sex: Mapped[str | None] = mapped_column(String(16), nullable=True)
@@ -84,4 +89,42 @@ class DuplicateGroup(Base):
     person_id: Mapped[int] = mapped_column(index=True)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     reason: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GoldPerson(Base):
+    """Gold-layer person: a Silver person whose record is "complete enough".
+
+    Gold = the curated, high-quality subset of Silver. A person qualifies when its
+    record clears a completeness threshold (>= 80% of the tracked data fields filled)
+    AND the five business-critical fields are present (full_name, passport, email,
+    city, company). The Gold stats tables (gold_*) are computed over THIS table, not
+    over all of Silver, so "Gold" means quality, not raw volume.
+
+    Rebuilt in full by warehouse/gold_layer.py. Mirrors the person columns plus a
+    stored completeness score for transparency.
+    """
+
+    __tablename__ = "gold_persons"
+
+    id: Mapped[int] = mapped_column(primary_key=True)  # same id as persons.id
+    match_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    passport: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    full_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lastname: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    sex: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    city: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    company: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    company_address: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    company_phone: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    company_email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    job: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    iban: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    salary: Mapped[float | None] = mapped_column(Float, nullable=True)
+    ipv4: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    completeness: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())

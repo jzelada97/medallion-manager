@@ -62,3 +62,36 @@ def test_clean_salary(value, expected):
 def test_normalize_key_typo_alias():
     """'Company Adress' (single d, as in generator README) resolves to canonical key."""
     assert normalize_key("Company Adress") == "companyaddress"
+
+
+# ----------------------------------------------------------------------
+# compute_norm_name — canonical materialized-name normalization (pure Python)
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, None),
+        ("", None),
+        ("   ", None),
+        ("William Weiss", "william weiss"),
+        ("  William   Weiss  ", "william weiss"),
+        ("María López", "maria lopez"),
+        ("Dr Juan Perez", "juan perez"),  # leading title stripped
+        ("Juan Perez MD", "juan perez"),  # trailing title stripped
+        ("Dr Juan Perez MD", "juan perez"),  # both ends stripped
+        ("Sr. Octavio Ponce Gimenez", "octavio ponce gimenez"),
+    ],
+)
+def test_compute_norm_name(raw, expected):
+    from hr_etl.processing.normalizer import compute_norm_name
+
+    assert compute_norm_name(raw) == expected
+
+
+def test_compute_norm_name_single_word_kept():
+    """A one-word name still normalizes (the >=2-token filter lives in reconcile, not here)."""
+    from hr_etl.processing.normalizer import compute_norm_name
+
+    assert compute_norm_name("Madonna") == "madonna"

@@ -251,3 +251,305 @@ def test_empty_warehouse(pg_session_factory):
         assert run_reconciliation(session) == 0
     finally:
         session.close()
+
+
+# ----------------------------------------------------------------------
+# Parity: the Python compute_norm_name MUST equal the SQL _NORM expression, char for
+# char. If they diverge, streaming and batch would write different norm_name values and
+# reconciliation would group incorrectly (architecture-reconcile.md risk).
+# ----------------------------------------------------------------------
+
+
+def test_norm_name_python_sql_parity(pg_session_factory):
+    from hr_etl.processing.normalizer import compute_norm_name
+    from hr_etl.processing.sql_norm import norm_sql
+
+    samples = [
+        "William Weiss",
+        "  William   Weiss  ",
+        "María López",
+        "Dr Juan Perez",
+        "Juan Perez MD",
+        "Dr Juan Perez MD",
+        "Sr. Octavio Ponce Gimenez",
+        "JEAN LECLERCQ",
+        "José Ángel Núñez",
+    ]
+    session = pg_session_factory()
+    try:
+        expr = norm_sql(":val")
+        for raw in samples:
+            sql_value = session.execute(text(f"SELECT {expr} AS n"), {"val": raw}).scalar_one()
+            py_value = compute_norm_name(raw)
+            assert (
+                sql_value == py_value
+            ), f"parity mismatch for {raw!r}: {sql_value!r} != {py_value!r}"
+    finally:
+        session.close()
+
+
+def test_backfill_populates_norm_name_before_detection(pg_session_factory):
+    """Rows inserted without norm_name (e.g. legacy/fixture) get it materialized by the
+    reconciliation guard, so detection still works over norm_name."""
+    session = pg_session_factory()
+    try:
+        # Insert with full_name only; norm_name left NULL on purpose.
+        a = _add_person(session, "k:bf-1", "maria lopez")
+        b = _add_person(session, "k:bf-2", "maria lopezz")
+        session.commit()
+
+        run_reconciliation(session, similarity_threshold=0.6)
+
+        # norm_name now materialized for both.
+        rows = {r.id: r.norm_name for r in session.query(PersonRow).all()}
+        assert rows[a.id] == "maria lopez"
+        assert rows[b.id] == "maria lopezz"
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
+    finally:
+        session.close()
+
+
+# ======================================================================
+# QA gap-filling tests — added to close the T-1..T-13 / SEC-T1..T7 matrix.
+# Same real-Postgres integration style as above (pg_trgm).
+# ======================================================================
+
+# Fixed set of allowed reason labels. Reconcile builds `reason` ONLY from these literals
+# via a SQL CASE (see reconcile._DETECT_SQL). No name/passport/city value ever appears.
+_ALLOWED_REASONS = {
+    "exact_name",
+    "fuzzy_name",
+    "fuzzy_name + same city",
+    "fuzzy_name + same company",
+    "name_containment + same city/company",
+}
+
+
+# ----------------------------------------------------------------------
+# T-4 — typo/near-identical surnames group together. Covers the second
+# canonical example from the spec ("maria martin" / "maria martins") in
+# addition to the leclerc/leclercq case already tested above.
+# ----------------------------------------------------------------------
+
+
+def test_t4_typo_maria_martin_groups(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "passport:T4a", "maria martin")
+        b = _add_person(session, "name:maria martins", "maria martins")
+        session.commit()
+
+        n = run_reconciliation(session, similarity_threshold=0.6)
+
+        assert n >= 2
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# T-7 — titles (honorifics/suffixes) are stripped at BOTH ends by the same
+# canonical normalization used in streaming, so "Dr Juan Perez" and
+# "Juan Perez MD" collapse to the same norm_name and land in one group
+# (exact_name after normalization). Complements the accents case (T-7).
+# ----------------------------------------------------------------------
+
+
+def test_t7_titles_stripped_group_together(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "passport:T7a", "Dr Juan Perez")
+        b = _add_person(session, "name:juan perez md", "Juan Perez MD")
+        session.commit()
+
+        n = run_reconciliation(session)  # strict default threshold: exact after normalize
+
+        assert n >= 2
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
+        # Same normalized name -> the reason is the exact-name label.
+        reasons = {m.reason for m in session.query(DuplicateGroup).all()}
+        assert "exact_name" in reasons
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# T-8 — a single-word normalized name (only a given name, no surname) is too
+# ambiguous to claim a duplicate and must NEVER form a group, even if the
+# same word repeats. reconcile requires >= 2 tokens (_MIN_NAME_TOKENS).
+# ----------------------------------------------------------------------
+
+
+def test_t8_single_word_name_never_groups(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        # Same single word twice: without the >=2-token rule these would "match".
+        _add_person(session, "passport:T8a", "madonna")
+        _add_person(session, "name:madonna-2", "madonna")
+        # A title + single word normalizes to a single word too -> still excluded.
+        _add_person(session, "name:dr-madonna", "Dr Madonna")
+        session.commit()
+
+        assert run_reconciliation(session, similarity_threshold=0.6) == 0
+        assert session.query(DuplicateGroup).count() == 0
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# T-9 — a repeated EMAIL across otherwise-different people is generator
+# noise (DEC-3/AC-10). Email is never a grouping signal: two different
+# names sharing an email must NOT be grouped.
+# ----------------------------------------------------------------------
+
+
+def test_t9_repeated_email_does_not_group(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        # Same email, clearly different names (different first-word blocks).
+        _add_person(session, "passport:T9a", "carlos gonzalez", email="cgonzalez@yahoo.com")
+        _add_person(session, "name:pedro ramirez", "pedro ramirez", email="cgonzalez@yahoo.com")
+        session.commit()
+
+        assert run_reconciliation(session, similarity_threshold=0.85) == 0
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# T-10 — idempotence: two consecutive runs over the same data yield the SAME
+# groups (rebuild clears the previous set; no accumulation, no drift).
+# ----------------------------------------------------------------------
+
+
+def test_t10_idempotent_two_runs_same_groups(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        _add_person(session, "passport:T10a", "maria lopez")
+        _add_person(session, "name:maria lopezz", "maria lopezz")
+        session.commit()
+
+        n1 = run_reconciliation(session, similarity_threshold=0.6)
+        snapshot1 = {
+            (m.group_id, m.person_id, m.reason) for m in session.query(DuplicateGroup).all()
+        }
+
+        n2 = run_reconciliation(session, similarity_threshold=0.6)
+        snapshot2 = {
+            (m.group_id, m.person_id, m.reason) for m in session.query(DuplicateGroup).all()
+        }
+
+        assert n1 == n2
+        assert snapshot1 == snapshot2  # identical membership set, no duplication
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# SEC-T1 — `reason` NEVER contains PII. After a run over seeded data, every
+# reason value is one of the fixed labels; no name/passport/city/similarity
+# digit leaks into it (security-reconcile.md DP-5).
+# ----------------------------------------------------------------------
+
+
+def test_sec_t1_reason_has_no_pii_only_fixed_labels(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        # A mix that exercises several reason branches.
+        _add_person(session, "passport:S1a", "jean leclerc", city="Paris")
+        _add_person(session, "name:jean leclercq", "jean leclercq", city="Paris")
+        _add_person(session, "passport:S1c", "octavio ponce", city="Madrid")
+        _add_person(session, "name:opg", "octavio ponce gimenez", city="Madrid")
+        session.commit()
+
+        run_reconciliation(session, similarity_threshold=0.6)
+
+        reasons = {m.reason for m in session.query(DuplicateGroup).all()}
+        assert reasons, "expected at least one group for this fixture"
+        # Every reason is a fixed label — nothing else.
+        assert (
+            reasons <= _ALLOWED_REASONS
+        ), f"unexpected reason label(s): {reasons - _ALLOWED_REASONS}"
+        # And explicitly: no seeded PII value appears inside any reason string.
+        pii_values = ["leclerc", "leclercq", "octavio", "ponce", "gimenez", "paris", "madrid"]
+        for r in reasons:
+            low = r.lower()
+            for pii in pii_values:
+                assert pii not in low, f"PII {pii!r} leaked into reason {r!r}"
+            # no similarity digits either
+            assert not any(ch.isdigit() for ch in r), f"digit leaked into reason {r!r}"
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# SEC-T2 — the duplicate_groups schema exposes NO PII columns: only the
+# numeric FK + label + confidence + timestamps (security-reconcile.md DP-1).
+# ----------------------------------------------------------------------
+
+
+def test_sec_t2_duplicate_groups_schema_has_no_pii_columns(pg_session_factory):
+    # Force schema creation.
+    _ = pg_session_factory()
+    engine = create_db_engine(DSN)
+    try:
+        with engine.connect() as conn:
+            cols = {
+                r[0]
+                for r in conn.execute(
+                    text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'duplicate_groups'"
+                    )
+                ).all()
+            }
+        assert cols == {"id", "group_id", "person_id", "confidence", "reason", "created_at"}
+        # Belt-and-braces: none of the PII field names is present as a column.
+        pii_columns = {
+            "passport",
+            "iban",
+            "salary",
+            "email",
+            "phone",
+            "ipv4",
+            "full_name",
+            "name",
+            "lastname",
+            "city",
+            "address",
+            "company",
+        }
+        assert cols.isdisjoint(pii_columns)
+    finally:
+        engine.dispose()
+
+
+# ----------------------------------------------------------------------
+# SEC-T3 — the reconciliation job logs only aggregates (counts/duration),
+# never PII. Capture the logger output during a run and assert no seeded
+# name/passport/city value appears (security-reconcile.md DP-4).
+# ----------------------------------------------------------------------
+
+
+def test_sec_t3_logs_contain_no_pii(pg_session_factory, caplog):
+    import logging
+
+    session = pg_session_factory()
+    try:
+        _add_person(session, "passport:S3a", "jean leclerc", city="Paris")
+        _add_person(session, "name:jean leclercq", "jean leclercq", city="Paris")
+        session.commit()
+
+        with caplog.at_level(logging.DEBUG):
+            run_reconciliation(session, similarity_threshold=0.6)
+
+        blob = "\n".join(rec.getMessage() for rec in caplog.records).lower()
+        for pii in ("leclerc", "leclercq", "jean", "paris", "passport:s3a"):
+            assert pii not in blob, f"PII {pii!r} leaked into logs"
+        # It SHOULD, however, log the operational summary (proves logging happened).
+        assert "reconciliation complete" in blob
+    finally:
+        session.close()

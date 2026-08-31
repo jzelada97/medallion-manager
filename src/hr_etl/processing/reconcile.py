@@ -63,12 +63,15 @@ Run: python -m hr_etl.processing.reconcile
 
 from __future__ import annotations
 
+import time
+
 from sqlalchemy import delete, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from hr_etl.logging_conf import get_logger
 from hr_etl.models.db_models import DuplicateGroup
+from hr_etl.processing.sql_norm import norm_sql
 
 logger = get_logger(__name__)
 
@@ -88,60 +91,48 @@ _STATEMENT_TIMEOUT_MS = 600_000  # 10 minutes
 # high-frequency first names from forming spurious groups.
 _MIN_NAME_TOKENS = 2
 
-# Titles/honorifics/suffixes to strip, mirrored from processing/normalizer.py so the
-# normalized name here matches the streaming pipeline. IMPORTANT: any of these can appear
-# on EITHER side of the name (the generator puts them as prefix OR suffix, e.g. "Dr Juan
-# Perez" and "Juan Perez MD" both occur). So we use ONE list and strip it from both ends,
-# twice, to also catch a title on both ends. Stripping matters: without it a leading
-# title dominates the name and unrelated people get matched together.
-_TITLES = (
-    r"mr|mrs|ms|miss|sir|dr|dr\(a\)|dott|dott\.ssa|ing|lic|mtro|prof|"
-    r"sr|sra|sr\(a\)|sig|sig\.ra|md|phd|ph\.d|jr|ii|iii|iv|pi|dds|esq"
-)
-_STRIP_PREFIX = rf"^({_TITLES})\.?\s+"  # a leading title + following space
-_STRIP_SUFFIX = rf"\s+({_TITLES})\.?$"  # a trailing space + title
-
-
-def _strip_titles_sql(expr: str) -> str:
-    """Wrap a SQL text expression to strip a leading/trailing title (both ends, twice)."""
-    for pattern in (_STRIP_PREFIX, _STRIP_SUFFIX, _STRIP_PREFIX, _STRIP_SUFFIX):
-        expr = f"btrim(regexp_replace({expr}, '{pattern}', '', 'i'))"
-    return expr
-
-
-# Strip common accents so "maría" and "maria" normalize to the same name (the streaming
-# normalizer does NFKD; we mirror it in SQL with translate(), which needs no extension).
-_ACCENTS_FROM = "áàäâãéèëêíìïîóòöôõúùüûñçý"
-_ACCENTS_TO = "aaaaaeeeeiiiiooooouuuuncy"
-_UNACCENT = f"translate(lower(full_name), '{_ACCENTS_FROM}', '{_ACCENTS_TO}')"
-
-# Normalized-name expression computed IN SQL: lowercase, strip accents, collapse
-# whitespace, strip titles from both ends, trim. Mirrors normalizer.normalize_text +
-# strip_titles (which also strip accents / titles) so batch matches the streaming keys.
-_NORM = _strip_titles_sql(f"btrim(regexp_replace({_UNACCENT}, '\\s+', ' ', 'g'))")
+# Canonical SQL norm expression (lowercase, translate accents, collapse whitespace, strip
+# titles both ends). Single source of truth in processing/sql_norm; identical to the
+# Python compute_norm_name and the migration backfill so streaming and batch agree.
+_NORM = norm_sql("full_name")
 
 # ---------------------------------------------------------------------------
-# Phase 1 — build a catalog of DISTINCT eligible names.
+# Phase 0 — ensure norm_name is materialized (idempotent, cheap).
+#
+# norm_name is normally written by the streaming warehouse writer and the one-off
+# migration backfill. This guarded UPDATE fills any row that has a full_name but no
+# norm_name yet (e.g. rows inserted directly in a test/fixture, or written before the
+# column existed). It is a WHERE-indexed no-op once everything is populated, so it does
+# NOT reintroduce the "recompute the regex over 2.2M rows every run" cost the redesign
+# removes — it only touches rows that are actually missing norm_name.
+# ---------------------------------------------------------------------------
+_BACKFILL_NORM_SQL = text(
+    f"""
+    UPDATE persons
+    SET norm_name = {_NORM}
+    WHERE full_name IS NOT NULL
+      AND (norm_name IS NULL OR norm_name = '');
+    """
+)
+
+# ---------------------------------------------------------------------------
+# Phase 1 — build a catalog of DISTINCT eligible names, reading the MATERIALIZED
+# norm_name (no per-row regex recompute over millions of rows).
 #
 # For each distinct normalized name we keep the smallest person id (anchor_id), plus one
 # representative city/company (for the reason label). Collapsing to distinct names is the
 # single most important optimization: it turns "millions of rows, many identical" into
 # "a smaller set of unique names", so the fuzzy step never wastes work on repeated names.
 # ---------------------------------------------------------------------------
-# First materialize (person id -> normalized name) ONCE, so the expensive title-strip
-# regex runs a single time per row (not again when we join persons back at the end).
 _BUILD_PN_SQL = text(
     f"""
     DROP TABLE IF EXISTS _recon_pn;
     CREATE TEMP TABLE _recon_pn AS
-        SELECT id, norm, city, company
-        FROM (
-            SELECT id, {_NORM} AS norm, city, company
-            FROM persons
-            WHERE full_name IS NOT NULL
-        ) s
-        WHERE length(norm) >= 3
-          AND array_length(regexp_split_to_array(norm, ' '), 1) >= {_MIN_NAME_TOKENS};
+        SELECT id, norm_name AS norm, city, company
+        FROM persons
+        WHERE norm_name IS NOT NULL
+          AND length(norm_name) >= 3
+          AND array_length(regexp_split_to_array(norm_name, ' '), 1) >= {_MIN_NAME_TOKENS};
     """
 )
 
@@ -310,19 +301,22 @@ def run_reconciliation(
     heavy work runs in Postgres over a catalog of DISTINCT names (not every row), and
     there is no cap on group size or membership count.
     """
-    # Always start clean (full rebuild). If the table doesn't exist yet, init_schema
-    # in main() creates it; here we just clear it.
-    session.execute(delete(DuplicateGroup))
-    session.commit()
+    started = time.monotonic()
 
     if not _ensure_pg_trgm(session):
         return 0
 
     try:
         # Bound every statement in this run as an anti-hang safety net (not a result cap).
-        session.execute(text(f"SET statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
+        session.execute(text(f"SET statement_timeout = {int(_STATEMENT_TIMEOUT_MS)}"))
         threshold = float(similarity_threshold)
-        # Phase 1: (person -> normalized name) once, distinct-name catalog + blocking keys.
+        # Clear previous groups INSIDE the same transaction as the rebuild, so the table
+        # is never observed empty: if the detect fails, the rollback restores the old
+        # groups (no partial/empty window). Full rebuild is atomic.
+        session.execute(delete(DuplicateGroup))
+        # Phase 0: ensure norm_name is materialized (guarded no-op once populated).
+        session.execute(_BACKFILL_NORM_SQL)
+        # Phase 1: distinct-name catalog + blocking keys, reading materialized norm_name.
         session.execute(_BUILD_PN_SQL)
         session.execute(_BUILD_NAMES_SQL)
         session.execute(_INDEX_NAMES_SQL)
@@ -334,18 +328,38 @@ def run_reconciliation(
         session.commit()
     except SQLAlchemyError as exc:
         session.rollback()
+        # Log the DB error type/message only — never the working rows (no PII, DP-4).
         logger.error("reconciliation query failed: %s", exc)
         return 0
 
     n_groups = session.execute(
         text("SELECT count(DISTINCT group_id) FROM duplicate_groups")
     ).scalar_one()
+    elapsed = time.monotonic() - started
     logger.info(
-        "reconciliation complete: %d memberships across %d groups",
+        "reconciliation complete: %d memberships across %d groups in %.1fs",
         written,
         n_groups,
+        elapsed,
     )
+    _record_metrics(elapsed, int(n_groups), int(written))
     return int(written)
+
+
+def _record_metrics(duration: float, n_groups: int, memberships: int) -> None:
+    """Publish reconciliation metrics (numeric only, never PII). Best-effort."""
+    try:
+        from hr_etl.metrics.prometheus import (
+            RECONCILE_DURATION_SECONDS,
+            RECONCILE_GROUPS,
+            RECONCILE_MEMBERSHIPS,
+        )
+
+        RECONCILE_DURATION_SECONDS.observe(duration)
+        RECONCILE_GROUPS.set(n_groups)
+        RECONCILE_MEMBERSHIPS.set(memberships)
+    except Exception:  # pragma: no cover - metrics must never fail the job
+        pass
 
 
 def main() -> None:

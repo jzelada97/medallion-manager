@@ -356,6 +356,88 @@ Frontend: pestaña **Duplicados** (muestra los grupos y el detalle de cada miemb
 > `duplicate_groups` (grupos). En una BD existente, hacer `DROP TABLE` de la vieja es
 > seguro porque la reconciliacion reconstruye todo en cada pasada.
 
+### Subsistema Duplicados / Consolidacion / Gold (rediseño para 2.2M filas)
+
+Validado con datos reales de la VM (2.211.131 filas). Tres jobs SQL-first encadenados,
+en orden estricto por dependencia de datos:
+
+```
+consolidate_merge  >>  reconcile  >>  refresh_gold
+```
+
+**`norm_name` materializado (columna en `persons`).** El nombre normalizado (minusculas,
+sin acentos, titulos quitados en ambos extremos, espacios colapsados) se persiste como
+columna indexada. Se calcula UNA vez y se consulta N veces, en vez de recomputar el regex
+sobre 2.2M filas en cada pasada. Fuente unica de verdad:
+`normalizer.compute_norm_name()` (streaming) espejado carácter a carácter por la expresion
+SQL `sql_norm.norm_sql()` (batch + backfill). Un test de paridad Python↔SQL evita que
+diverjan. Indices: btree (`ix_persons_norm_name`) para el JOIN/GROUP BY y GIN trigram
+(`ix_persons_norm_name_trgm`) para `similarity()`/`%`. Los crea la migracion idempotente
+`warehouse/migrations/001_reconcile.sql` (ademas de `CREATE EXTENSION pg_trgm` y el
+backfill de las filas historicas). La migracion la ejecuta `init_schema` de forma
+idempotente (se salta en backends no-Postgres).
+
+**1. Fix de consolidacion (`consolidate_merge.py`, Silver).** El streaming a veces deja la
+misma persona partida en 2 filas de `persons` (mismo `passport`, fragmentos
+complementarios con distinto `match_key`). Este job las fusiona en Postgres:
+
+- Solo fusiona **mismo `passport` Y `norm_name` muy parecido** (`similarity >= 0.85`).
+  Passport igual + nombres claramente distintos = colision del generador → NO se fusiona.
+- **Survivorship**: superviviente = `min(id)`; primer valor no nulo por campo (nunca pisa
+  un dato bueno con NULL); `full_name` = el mas largo; `created_at` = el mas antiguo;
+  `updated_at` = el mas reciente; `norm_name` se recalcula del `full_name` ganador.
+- Todo set-based en una transaccion; a Python solo vuelven conteos (RAM plana). Idempotente.
+
+**2. Reconciliacion (`reconcile.py`).** Igual que antes (dos reglas typo/contencion,
+blocking `keyt`/`key2`, ancla `min(id)`, `INSERT...SELECT`, sin caps), pero la Fase 1 ahora
+**lee `norm_name` ya materializado** en lugar de recomputar el regex sobre 2.2M filas — el
+cambio clave para que escale (~2-4 min estimado en la VM). Un guard idempotente rellena
+`norm_name` de filas que no lo tengan antes de detectar. `reason` sigue siendo solo
+etiquetas fijas (sin PII).
+
+**3. Gold de personas (`gold_layer.py`).** Se añade la tabla `gold_persons` = subconjunto
+"completo" de Silver: **≥80% de los 8 campos de datos rellenos Y los 5 obligatorios**
+presentes (`full_name`, `passport`, `email`, `city`, `company`). Las stats `gold_*`
+(`gold_stats`, `gold_top_cities`, `gold_top_companies`, `gold_completeness`) ahora se
+calculan **sobre `gold_persons`** (calidad), no sobre todo Silver (volumen). Rebuild
+completo idempotente.
+
+Ejecucion (o via el DAG `hr_etl_maintenance`):
+```
+python -m hr_etl.processing.consolidate_merge
+python -m hr_etl.processing.reconcile
+python -m hr_etl.warehouse.gold_layer
+```
+
+Metricas Prometheus añadidas (solo numericas, sin PII): `hr_etl_consolidation_merged_rows_total`,
+`hr_etl_reconcile_duration_seconds`, `hr_etl_reconcile_groups`, `hr_etl_reconcile_memberships`,
+`hr_etl_gold_persons`.
+
+#### Ideas RECHAZADAS y por que (DEC-9)
+
+- **passport/email como eje de la pestaña Duplicados** → passport repetido es un fix de
+  consolidacion (misma persona partida), no un "posible duplicado"; email repetido es RUIDO
+  del generador (p. ej. `cgonzalez@yahoo.com` en 45 personas distintas). Ni email ni phone
+  ni iban se usan para agrupar/consolidar (iban ademas es unico → identificador, no señal
+  de duplicado). Fallo conocido del generador.
+- **`similarity()` en el `JOIN ON` sobre columna calculada** → no usa el GIN → self-join
+  O(n²) → timeout. Se usa blocking por igualdad + trigrama solo dentro de micro-bloques.
+- **Blocking por primera palabra del nombre** → bloques contaminados por nombres de pila
+  frecuentes ("juan" ~20k) → cartesiano. Se usa `keyt` (nombre + 3 letras del apellido).
+- **LATERAL nearest-neighbor con `<-> LIMIT k` por fila** → una busqueda GIN por cada una
+  de 2.2M filas → 312s. No hay busqueda por fila: un unico hash-join sobre el catalogo.
+- **Recomputar el regex de normalizacion en cada corrida** (lo hacia la version previa) →
+  sustituido por `norm_name` materializado + backfill.
+- **Escritura de memberships via ORM `add_all` (cientos de miles de objetos)** →
+  `INSERT...SELECT`, las filas nunca viajan a Python.
+- **Clustering transitivo perfecto (Union-Find / CTE recursiva)** → coste/riesgo en la VM;
+  el ancla `min(id)` es correcto para la gran mayoria de nombres. Fuera de alcance.
+- **Incremental por bloques con `reconcile_state`** → para no perder conexiones entre lotes
+  habria que recomputar los bloques `keyt`/`key2` completos afectados, que con nombres muy
+  frecuentes abarca casi todo el catalogo (degenera en rebuild pero con deuda de estado).
+  Se eligio **rebuild completo optimizado**, que cabe en presupuesto y es idempotente. El
+  incremental queda como plan B documentado solo si la medicion en la VM lo exige.
+
 ### Analisis de los datos del generador (hallazgos)
 
 Tras analizar ~500k mensajes del generador, documentamos estos patrones:
@@ -630,12 +712,17 @@ completo. Las principales:
 
 ### Ya implementado (nivel Experto)
 
-- **Reconciliacion batch**: job periodico (`hr_etl_reconciliation` en Airflow) que cruza
-  registros y guarda candidatos a duplicado en `match_candidates` (ver seccion de matching).
-- **Capa Gold + Medallion**: agregados precomputados refrescados por Airflow, expuestos por
-  la API (`/gold/*`, `/medallion`) y visualizados en la pestaña Arquitectura del frontend.
-- **Orquestacion con Airflow 3**: DAG event-driven con sensor deferrable que refresca Gold
-  cuando entran suficientes personas nuevas (o cada 15 min como fallback).
+- **Reconciliacion batch**: job periodico que agrupa candidatos a duplicado por nombre
+  difuso en `duplicate_groups`, leyendo `norm_name` materializado (ver seccion de matching).
+- **Fix de consolidacion (Silver)**: `consolidate_merge` fusiona la misma persona partida en
+  varias filas (mismo passport + nombre muy parecido) con reglas de survivorship.
+- **Capa Gold + Medallion**: `gold_persons` (subconjunto completo de Silver) + agregados
+  `gold_*` recalculados sobre ese subconjunto, expuestos por la API (`/gold/*`, `/medallion`)
+  y visualizados en la pestaña Arquitectura del frontend.
+- **Orquestacion con Airflow 3**: DAG secuencial `hr_etl_maintenance`
+  (`consolidate_merge >> reconcile >> refresh_gold`, cada 30 min, `max_active_runs=1`) por
+  dependencia de datos; y DAG event-driven con sensor deferrable que refresca Gold cuando
+  entran suficientes personas nuevas (o cada 15 min como fallback).
 - **CI/CD**: workflow unico que corre lint + tests y, si pasan en `main`, despliega por SSH
   a la VM de Oracle.
 

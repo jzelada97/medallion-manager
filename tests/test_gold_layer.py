@@ -76,6 +76,8 @@ def pg_engine():
 
 
 def _seed(engine) -> None:
+    """Seed 3 persons. Only the FIRST clears the Gold bar (5 obligatory + >=7/8 fields);
+    the second is missing iban/email/phone/ipv4 (below 80%), the third is name-only."""
     prefix = uuid.uuid4().hex[:6]
     rows = [
         PersonRow(
@@ -126,6 +128,8 @@ def test_init_gold_schema_is_idempotent(pg_engine):
 
 
 def test_refresh_gold_populates_stats(pg_engine):
+    """gold_* stats are now computed over gold_persons (the curated subset), not Silver.
+    Of the 3 seeded persons only 1 qualifies for Gold, so the stats reflect that one."""
     init_gold_schema(pg_engine)
     _seed(pg_engine)
     refresh_gold(pg_engine)
@@ -134,14 +138,14 @@ def test_refresh_gold_populates_stats(pg_engine):
         row = conn.execute(text("SELECT * FROM gold_stats WHERE id = 1")).fetchone()
 
     assert row is not None
-    assert row.total_persons == 3
-    assert row.with_passport == 2
-    assert row.with_city == 2
-    assert row.with_company == 2
+    assert row.total_persons == 1  # only the fully-complete person is Gold
+    assert row.with_passport == 1
+    assert row.with_city == 1
+    assert row.with_company == 1
     assert row.with_bank == 1  # one iban
     assert row.with_ipv4 == 1
-    assert row.cross_linked == 2  # passport AND city both present for 2 rows
-    assert row.avg_completeness > 0
+    assert row.cross_linked == 1
+    assert row.avg_completeness == pytest.approx(8.0)  # the Gold person has all 8 fields
 
 
 def test_refresh_gold_top_cities_and_companies(pg_engine):
@@ -157,10 +161,10 @@ def test_refresh_gold_top_cities_and_companies(pg_engine):
             text("SELECT company, person_count FROM gold_top_companies ORDER BY person_count DESC")
         ).fetchall()
 
-    assert cities[0].city == "madrid"
-    assert cities[0].person_count == 2
-    companies_set = {c.company for c in companies}
-    assert companies_set == {"acme", "globex"}
+    # Only the Gold person (madrid / acme) contributes.
+    assert [c.city for c in cities] == ["madrid"]
+    assert cities[0].person_count == 1
+    assert {c.company for c in companies} == {"acme"}
 
 
 def test_refresh_gold_completeness_distribution(pg_engine):
@@ -174,9 +178,8 @@ def test_refresh_gold_completeness_distribution(pg_engine):
         ).fetchall()
 
     total = sum(r.person_count for r in rows)
-    assert total == 3  # every person contributes to exactly one bucket
-    # buckets are ordered ascending by number of filled fields
-    assert [r.fields_filled for r in rows] == sorted(r.fields_filled for r in rows)
+    assert total == 1  # only the Gold person is counted
+    assert rows[0].fields_filled == 8  # it has all 8 data fields
 
 
 def test_refresh_gold_is_rebuild(pg_engine):
@@ -208,3 +211,73 @@ def test_refresh_gold_on_empty_persons(pg_engine):
     assert row is not None
     assert row.total_persons == 0
     assert row.avg_completeness == 0.0
+
+
+# ----------------------------------------------------------------------
+# T-12 — Gold membership: only complete records enter gold_persons, and the
+# gold_* stats are computed over that subset (DEC-5, AC-9).
+# ----------------------------------------------------------------------
+
+
+def test_t12_gold_persons_membership_and_stats(pg_engine):
+    """Persons below 80% OR missing one of the 5 obligatory fields are NOT Gold; a
+    complete person IS Gold; the returned count and gold_persons cardinality agree."""
+    init_gold_schema(pg_engine)
+    prefix = uuid.uuid4().hex[:6]
+    from hr_etl.warehouse.engine import make_session_factory
+
+    session = make_session_factory(pg_engine)()
+    try:
+        # (a) fully complete -> Gold (8/8 fields, all 5 obligatory).
+        complete = PersonRow(
+            match_key=f"passport:{prefix}-complete",
+            passport="P1",
+            full_name="ana gil",
+            city="madrid",
+            company="acme",
+            iban="ES1",
+            email="ana@x.com",
+            phone="600",
+            ipv4="1.1.1.1",
+        )
+        # (b) 7/8 fields but MISSING an obligatory (company) -> NOT Gold.
+        missing_obligatory = PersonRow(
+            match_key=f"passport:{prefix}-noobl",
+            passport="P2",
+            full_name="bea ruiz",
+            city="madrid",
+            iban="ES2",
+            email="bea@x.com",
+            phone="601",
+            ipv4="2.2.2.2",
+        )
+        # (c) has all 5 obligatory but only 5/8 fields (< 80%) -> NOT Gold.
+        below_threshold = PersonRow(
+            match_key=f"passport:{prefix}-below",
+            passport="P3",
+            full_name="carlos sanz",
+            city="madrid",
+            company="globex",
+            email="carlos@x.com",
+        )
+        session.add_all([complete, missing_obligatory, below_threshold])
+        session.commit()
+        complete_id = complete.id
+    finally:
+        session.close()
+
+    gold_count = refresh_gold(pg_engine)
+
+    with pg_engine.connect() as conn:
+        ids = [r.id for r in conn.execute(text("SELECT id FROM gold_persons ORDER BY id"))]
+        stats_total = conn.execute(
+            text("SELECT total_persons FROM gold_stats WHERE id = 1")
+        ).scalar_one()
+        stored = conn.execute(
+            text("SELECT completeness FROM gold_persons WHERE id = :i"), {"i": complete_id}
+        ).scalar_one()
+
+    assert ids == [complete_id]  # only the complete person is Gold
+    assert gold_count == 1
+    assert stats_total == 1  # stats computed over gold_persons agree with its cardinality
+    assert stored == pytest.approx(1.0)  # 8/8 fields -> completeness 1.0

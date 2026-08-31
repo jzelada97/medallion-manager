@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from hr_etl.logging_conf import get_logger
 from hr_etl.models.db_models import PersonRow
 from hr_etl.models.person import Person
+from hr_etl.processing.normalizer import compute_norm_name
+from hr_etl.processing.sql_norm import norm_sql
 
 logger = get_logger(__name__)
 
@@ -77,6 +79,10 @@ class PersonRepository:
                     if new_value not in (None, "") and current in (None, ""):
                         setattr(row, field, new_value)
 
+            # norm_name is a DERIVED column: keep it in sync with the resulting
+            # full_name. Does not touch match_key or the merge/fill logic above.
+            row.norm_name = compute_norm_name(row.full_name)
+
             session.commit()
             logger.debug("upserted person match_key=%s id=%s", person.match_key, row.id)
             return row.id
@@ -115,6 +121,9 @@ class PersonRepository:
             # conflict keeps existing values, so NULLs never overwrite good data.
             payload = {field: non_empty.get(field) for field in _FIELDS}
             payload["match_key"] = person.match_key
+            # Derived norm_name for the INSERT path (new rows). On conflict it is
+            # recomputed from the surviving full_name below.
+            payload["norm_name"] = compute_norm_name(person.full_name)
             rows.append(payload)
 
         if not rows:
@@ -131,6 +140,13 @@ class PersonRepository:
                 field: func.coalesce(PersonRow.__table__.c[field], stmt.excluded[field])
                 for field in _FIELDS
             }
+            # norm_name follows the SURVIVING full_name: recompute it in SQL from the
+            # COALESCE of existing/incoming full_name so it stays consistent after a
+            # gap-fill. norm_sql() over the fixed literal below (no external input) is
+            # the same canonical expression used by the batch jobs and the backfill.
+            update_cols["norm_name"] = text(
+                norm_sql("COALESCE(persons.full_name, excluded.full_name)")
+            )
             stmt = stmt.on_conflict_do_update(
                 index_elements=["match_key"],
                 set_=update_cols,

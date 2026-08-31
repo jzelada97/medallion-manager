@@ -87,3 +87,70 @@ def clean_salary(value: Any) -> float | None:
         return float(digits) if digits not in ("", "-", ".") else None
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Canonical normalized name (``norm_name``) — single source of truth.
+#
+# ``norm_name`` is a persisted, derived column on ``persons`` used by the batch
+# reconciliation/consolidation jobs so they never recompute a heavy regex over millions
+# of rows. It MUST be produced identically by:
+#   * the streaming warehouse writer (Python: ``compute_norm_name``), and
+#   * the SQL backfill / survivorship recompute (the ``_NORM`` expression in
+#     ``processing/reconcile.py`` and ``warehouse/migrations/001_reconcile.sql``).
+#
+# So this function deliberately MIRRORS the SQL expression character-for-character
+# instead of reusing ``normalize_text``/``strip_titles`` (which use full NFKD and a
+# different regex order). The reference pipeline is:
+#   1. lowercase
+#   2. translate a fixed accent set to ASCII (same map as SQL ``translate``)
+#   3. collapse any whitespace run to a single space, then trim
+#   4. strip a leading/trailing title (both ends, applied prefix/suffix/prefix/suffix)
+#
+# A parity test (Python vs the SQL ``_NORM``) guards against divergence.
+# ---------------------------------------------------------------------------
+
+# Same accent map as the SQL ``translate(lower(full_name), _ACCENTS_FROM, _ACCENTS_TO)``.
+_NORM_ACCENTS_FROM = "áàäâãéèëêíìïîóòöôõúùüûñçý"
+_NORM_ACCENTS_TO = "aaaaaeeeeiiiiooooouuuuncy"
+_NORM_ACCENT_TABLE = str.maketrans(_NORM_ACCENTS_FROM, _NORM_ACCENTS_TO)
+
+# Titles/honorifics/suffixes, mirrored from the SQL ``_TITLES`` list in reconcile.py.
+# Any of these may appear as a prefix OR suffix; they are stripped from both ends.
+_NORM_TITLES = (
+    r"mr|mrs|ms|miss|sir|dr|dr\(a\)|dott|dott\.ssa|ing|lic|mtro|prof|"
+    r"sr|sra|sr\(a\)|sig|sig\.ra|md|phd|ph\.d|jr|ii|iii|iv|pi|dds|esq"
+)
+# Mirror the SQL ``regexp_replace(..., '^(<titles>)\.?\s+', '', 'i')`` (prefix) and the
+# trailing variant. Case-insensitive, one optional dot, then a required space boundary.
+_NORM_STRIP_PREFIX_RE = re.compile(rf"^({_NORM_TITLES})\.?\s+", re.IGNORECASE)
+_NORM_STRIP_SUFFIX_RE = re.compile(rf"\s+({_NORM_TITLES})\.?$", re.IGNORECASE)
+
+
+def compute_norm_name(full_name: str | None) -> str | None:
+    """Return the canonical ``norm_name`` for a full name, mirroring the SQL ``_NORM``.
+
+    Steps (identical to the SQL expression used by the batch jobs and backfill):
+    lowercase, translate a fixed accent set to ASCII, collapse whitespace, trim, then
+    strip a leading/trailing title from both ends (applied prefix, suffix, prefix,
+    suffix — so a title on both ends is caught).
+
+    Returns ``None`` when there is no usable name (``None``/empty), matching the SQL
+    ``WHERE full_name IS NOT NULL`` guard: rows without a full name get a NULL
+    ``norm_name`` rather than an empty string.
+    """
+    if full_name is None:
+        return None
+    # 1. lowercase, 2. translate accents (fixed map, NOT full NFKD — matches SQL).
+    text = str(full_name).lower().translate(_NORM_ACCENT_TABLE)
+    # 3. collapse whitespace runs to a single space, then trim.
+    text = _WS_RE.sub(" ", text).strip()
+    # 4. strip titles from both ends, twice (prefix, suffix, prefix, suffix).
+    for pattern in (
+        _NORM_STRIP_PREFIX_RE,
+        _NORM_STRIP_SUFFIX_RE,
+        _NORM_STRIP_PREFIX_RE,
+        _NORM_STRIP_SUFFIX_RE,
+    ):
+        text = pattern.sub("", text).strip()
+    return text or None
