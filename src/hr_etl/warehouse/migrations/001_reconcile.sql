@@ -19,6 +19,11 @@
 
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 
+-- Add norm_name to an EXISTING persons table. create_all() only adds columns to tables
+-- it creates from scratch, never to a pre-existing table (the 2.2M-row prod table), so
+-- the column must be added explicitly here. Idempotent via IF NOT EXISTS.
+ALTER TABLE persons ADD COLUMN IF NOT EXISTS norm_name VARCHAR(255);
+
 -- btree: used by the final join persons.norm_name = catalog.norm and the GROUP BY.
 CREATE INDEX IF NOT EXISTS ix_persons_norm_name
     ON persons (norm_name);
