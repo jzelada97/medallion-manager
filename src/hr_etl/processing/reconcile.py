@@ -109,9 +109,16 @@ def _strip_titles_sql(expr: str) -> str:
     return expr
 
 
-# Normalized-name expression computed IN SQL: lowercase, collapse whitespace, strip
-# titles from both ends, trim. Mirrors normalizer.strip_titles + normalize_text.
-_NORM = _strip_titles_sql("btrim(regexp_replace(lower(full_name), '\\s+', ' ', 'g'))")
+# Strip common accents so "maría" and "maria" normalize to the same name (the streaming
+# normalizer does NFKD; we mirror it in SQL with translate(), which needs no extension).
+_ACCENTS_FROM = "áàäâãéèëêíìïîóòöôõúùüûñçý"
+_ACCENTS_TO = "aaaaaeeeeiiiiooooouuuuncy"
+_UNACCENT = f"translate(lower(full_name), '{_ACCENTS_FROM}', '{_ACCENTS_TO}')"
+
+# Normalized-name expression computed IN SQL: lowercase, strip accents, collapse
+# whitespace, strip titles from both ends, trim. Mirrors normalizer.normalize_text +
+# strip_titles (which also strip accents / titles) so batch matches the streaming keys.
+_NORM = _strip_titles_sql(f"btrim(regexp_replace({_UNACCENT}, '\\s+', ' ', 'g'))")
 
 # ---------------------------------------------------------------------------
 # Phase 1 — build a catalog of DISTINCT eligible names.
@@ -150,6 +157,10 @@ _BUILD_NAMES_SQL = text(
                words,
                words[1] AS key1,
                (words[1] || ' ' || words[2]) AS key2,
+               -- typo blocking key: given name + first 3 chars of the first surname.
+               -- Splits the huge "juan" block (~20k) into small sub-blocks while still
+               -- sharing the key across a surname typo past the 3rd char.
+               (words[1] || '|' || left(words[2], 3)) AS keyt,
                n_persons, anchor_id, city, company
         FROM (
             SELECT norm,
@@ -165,10 +176,11 @@ _BUILD_NAMES_SQL = text(
 )
 
 _INDEX_NAMES_SQL = text(
-    "CREATE INDEX _recon_names_trgm ON _recon_names USING gin (norm gin_trgm_ops);"
-    " CREATE INDEX _recon_names_norm ON _recon_names (norm);"
-    " CREATE INDEX _recon_names_key1 ON _recon_names (key1);"
+    # Both rules now block by an equality key (keyt / key2), so plain btree indexes are
+    # enough — no GIN trigram index needed (it was expensive to build on 2M+ names).
+    "CREATE INDEX _recon_names_norm ON _recon_names (norm);"
     " CREATE INDEX _recon_names_key2 ON _recon_names (key2);"
+    " CREATE INDEX _recon_names_keyt ON _recon_names (keyt);"
     " CREATE INDEX _recon_pn_norm ON _recon_pn (norm);"
     " ANALYZE _recon_names;"
     " ANALYZE _recon_pn;"
@@ -178,16 +190,14 @@ _INDEX_NAMES_SQL = text(
 # Phase 2 — link distinct names via TWO rules, each with its OWN efficient blocking,
 # then group by canonical anchor and propagate to persons.
 #
-#   RULE 1 — TYPO (trigram similarity >= :threshold). Blocking = SAME FIRST WORD (given
-#   name, which a surname typo doesn't change), so the trigram `%` only runs within one
-#   given name instead of scanning the whole index per name — the key speedup on 2M+ rows.
-#   Catches "jean leclerc" vs "jean leclercq".
+#   RULE 1 — TYPO (trigram similarity >= :threshold). Blocking = keyt (given name + first
+#   3 chars of the first surname), an equality join. This splits huge given-name blocks
+#   into tiny sub-blocks so `similarity()` only runs on a handful of candidates — the key
+#   speedup on 2M+ rows. Catches "jean leclerc" vs "jean leclercq".
 #
-#   RULE 2 — CONTAINMENT (every word of one name is in the other). Blocking = share a
-#   whole word (equi-join on the token table), then the `<@` array test. Catches
-#   "octavio ponce" ⊆ "octavio ponce gimenez" WITHOUT lowering the similarity threshold.
-#   Trigram similarity would miss this; a low trigram threshold would be far too slow, so
-#   containment gets its own word-based blocking instead.
+#   RULE 2 — CONTAINMENT (every word of one name is in the other). Blocking = key2 (first
+#   two words), then the `<@` array test. Catches "octavio ponce" ⊆ "octavio ponce
+#   gimenez" WITHOUT lowering the similarity threshold (trigram similarity would miss it).
 #
 # The two candidate-pair sets are UNIONed, self is added (so every name anchors), then a
 # single grouping assigns group_id = smallest anchor_id among linked names. No caps.
@@ -195,25 +205,27 @@ _INDEX_NAMES_SQL = text(
 _DETECT_SQL = text(
     """
     WITH typo_pairs AS (
-        -- rule 1: typo/letter-swap. Blocking = SAME FIRST WORD (given name), which a
-        -- surname typo never changes; this restricts the trigram work to within one given
-        -- name instead of scanning the whole GIN index per name. Then the index-backed
-        -- `%` + strict similarity make the decision. Catches "jean leclerc"/"jean leclercq".
+        -- rule 1: typo/letter-swap. Blocking = given name + first 3 chars of the first
+        -- surname (keyt). This splits huge given-name blocks ("juan" ~20k) into small
+        -- sub-blocks, so the trigram similarity only runs within a tiny candidate set.
+        -- A surname typo past the 3rd char keeps the same keyt. Catches "jean leclerc"/
+        -- "jean leclercq". (Trade-off: a typo within the first 3 surname chars is missed;
+        -- accepted so the job scales on millions of rows.)
         SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, FALSE AS contain
         FROM _recon_names n
         JOIN _recon_names m
-          ON n.key1 = m.key1                 -- blocking: same given name
+          ON n.keyt = m.keyt                 -- blocking: given name + surname prefix
          AND n.norm <> m.norm
-         AND m.norm % n.norm                 -- index-backed trigram candidate
          AND similarity(n.norm, m.norm) >= :threshold
     ),
     contain_pairs AS (
-        -- rule 2: containment. Blocking key = the first TWO words (given name + first
-        -- surname). Two names can only be in a containment relationship if they agree on
-        -- their leading words, so this key is both correct and far more selective than a
-        -- single shared word (which explodes on common given names). We then confirm with
-        -- the full word-subset test. Only names with a different word count can be a
-        -- proper containment (equal-length would be caught by the typo rule if similar).
+        -- rule 2: containment. Blocking key = first two words (given name + first
+        -- surname). Then the full word-subset test on names of DIFFERENT length.
+        -- IMPORTANT: containment alone ("juan garcia" ⊆ "juan garcia X") would merge every
+        -- unrelated "Juan Garcia <extra>" into one giant group. To stay a *plausible*
+        -- duplicate we REQUIRE a corroborating field: same non-null city OR same non-null
+        -- company. So "octavio ponce" and "octavio ponce gimenez" link only when they also
+        -- share a city/company — i.e. when they're actually likely the same person.
         SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, TRUE AS contain
         FROM _recon_names n
         JOIN _recon_names m
@@ -221,6 +233,10 @@ _DETECT_SQL = text(
          AND n.norm <> m.norm
          AND array_length(n.words, 1) <> array_length(m.words, 1)
          AND (n.words <@ m.words OR m.words <@ n.words)
+         AND (
+              (n.city IS NOT NULL AND n.city = m.city)
+              OR (n.company IS NOT NULL AND n.company = m.company)
+         )
     ),
     links AS (
         SELECT a, b, sim, contain FROM typo_pairs
@@ -250,20 +266,21 @@ _DETECT_SQL = text(
         GROUP BY group_id
         HAVING sum(n_persons) > 1
     )
-    SELECT p.id AS person_id,
-           g.group_id,
-           COALESCE(g.fuzzy_sim, 1.0) AS confidence,
+    INSERT INTO duplicate_groups (group_id, person_id, confidence, reason, created_at)
+    SELECT g.group_id,
+           p.id AS person_id,
+           round(COALESCE(g.fuzzy_sim, 1.0)::numeric, 3) AS confidence,
            CASE
-               WHEN g.has_containment_link THEN 'name_containment'
+               WHEN g.has_containment_link THEN 'name_containment + same city/company'
                WHEN g.city IS NOT NULL AND g.has_link THEN 'fuzzy_name + same city'
                WHEN g.company IS NOT NULL AND g.has_link THEN 'fuzzy_name + same company'
                WHEN g.has_link THEN 'fuzzy_name'
                ELSE 'exact_name'
-           END AS reason
+           END AS reason,
+           now()
     FROM name_groups g
     JOIN real_groups r ON r.group_id = g.group_id
     JOIN _recon_pn p ON p.norm = g.norm
-    ORDER BY g.group_id, p.id
     """
 )
 
@@ -304,43 +321,31 @@ def run_reconciliation(
     try:
         # Bound every statement in this run as an anti-hang safety net (not a result cap).
         session.execute(text(f"SET statement_timeout = {_STATEMENT_TIMEOUT_MS}"))
-        # The `%` operator (rule-1 blocking) matches when similarity >= this session
-        # threshold; align it with our strict decision threshold so it stays fast and
-        # precise. SET takes no bind params, so the validated float is inlined.
         threshold = float(similarity_threshold)
-        session.execute(text(f"SET pg_trgm.similarity_threshold = {threshold}"))
-        # Phase 1: (person -> normalized name) once, distinct-name catalog, token keys.
+        # Phase 1: (person -> normalized name) once, distinct-name catalog + blocking keys.
         session.execute(_BUILD_PN_SQL)
         session.execute(_BUILD_NAMES_SQL)
         session.execute(_INDEX_NAMES_SQL)
-        # Phase 2: link names (typo + containment), group, propagate to persons (no caps).
-        rows = session.execute(_DETECT_SQL, {"threshold": threshold}).all()
+        # Phase 2: link names (typo + containment), group, and INSERT memberships straight
+        # into duplicate_groups — the rows never travel to Python (no ORM materialization
+        # of hundreds of thousands of objects), which keeps it fast and memory-flat.
+        result = session.execute(_DETECT_SQL, {"threshold": threshold})
+        written = result.rowcount
+        session.commit()
     except SQLAlchemyError as exc:
         session.rollback()
         logger.error("reconciliation query failed: %s", exc)
         return 0
 
-    memberships = [
-        DuplicateGroup(
-            group_id=int(r.group_id),
-            person_id=int(r.person_id),
-            confidence=round(float(r.confidence), 3),
-            reason=r.reason,
-        )
-        for r in rows
-    ]
-
-    if memberships:
-        session.add_all(memberships)
-        session.commit()
-
-    n_groups = len({m.group_id for m in memberships})
+    n_groups = session.execute(
+        text("SELECT count(DISTINCT group_id) FROM duplicate_groups")
+    ).scalar_one()
     logger.info(
         "reconciliation complete: %d memberships across %d groups",
-        len(memberships),
+        written,
         n_groups,
     )
-    return len(memberships)
+    return int(written)
 
 
 def main() -> None:

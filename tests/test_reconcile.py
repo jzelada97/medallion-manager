@@ -107,15 +107,18 @@ def test_fuzzy_groups_typo_surname(pg_session_factory):
 
 
 def test_containment_extra_surname_groups(pg_session_factory):
-    """A shorter name fully contained in a longer one is a match, even below threshold.
+    """A shorter name contained in a longer one links WHEN a field corroborates.
 
     "octavio ponce" ⊆ "octavio ponce gimenez": trigram similarity is < 0.85, so only the
-    word-containment rule links them. This must hold at the strict default threshold.
+    containment rule can link them — and only because they share a city (the corroborating
+    field that keeps containment from merging unrelated homonyms).
     """
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:X1", "octavio ponce")
-        b = _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez")
+        a = _add_person(session, "passport:X1", "octavio ponce", city="Madrid")
+        b = _add_person(
+            session, "name:octavio ponce gimenez", "octavio ponce gimenez", city="Madrid"
+        )
         session.commit()
 
         # default strict threshold (0.85): only containment can link these
@@ -125,7 +128,41 @@ def test_containment_extra_surname_groups(pg_session_factory):
         groups = _groups(session)
         assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
         reasons = {m.reason for m in session.query(DuplicateGroup).all()}
-        assert "name_containment" in reasons
+        assert any("name_containment" in r for r in reasons)
+    finally:
+        session.close()
+
+
+def test_containment_without_corroboration_no_group(pg_session_factory):
+    """Containment alone (no shared city/company) must NOT link — avoids homonym pile-ups.
+
+    Two "octavio ponce ..." in DIFFERENT cities are probably different people, so the
+    containment rule requires a corroborating field and should leave them ungrouped.
+    """
+    session = pg_session_factory()
+    try:
+        _add_person(session, "passport:X1", "octavio ponce", city="Madrid")
+        _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez", city="Sevilla")
+        session.commit()
+
+        assert run_reconciliation(session) == 0
+    finally:
+        session.close()
+
+
+def test_accents_normalized_together(pg_session_factory):
+    """ "María López" and "Maria Lopez" are the same person (accents stripped)."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "passport:X1", "María López")
+        b = _add_person(session, "name:maria lopez", "Maria Lopez")
+        session.commit()
+
+        n = run_reconciliation(session)
+
+        assert n >= 2
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
     finally:
         session.close()
 
