@@ -128,11 +128,12 @@ _BUILD_PN_SQL = text(
     f"""
     DROP TABLE IF EXISTS _recon_pn;
     CREATE TEMP TABLE _recon_pn AS
-        SELECT id, norm_name AS norm, city, company
+        SELECT id, norm_name AS norm, passport, email, phone, city, address, company
         FROM persons
         WHERE norm_name IS NOT NULL
           AND length(norm_name) >= 3
           AND array_length(regexp_split_to_array(norm_name, ' '), 1) >= {_MIN_NAME_TOKENS};
+    CREATE INDEX _recon_pn_norm ON _recon_pn (norm);
     """
 )
 
@@ -167,12 +168,11 @@ _BUILD_NAMES_SQL = text(
 )
 
 _INDEX_NAMES_SQL = text(
-    # Both rules now block by an equality key (keyt / key2), so plain btree indexes are
+    # Both name rules block by an equality key (keyt / key2), so plain btree indexes are
     # enough — no GIN trigram index needed (it was expensive to build on 2M+ names).
     "CREATE INDEX _recon_names_norm ON _recon_names (norm);"
     " CREATE INDEX _recon_names_key2 ON _recon_names (key2);"
     " CREATE INDEX _recon_names_keyt ON _recon_names (keyt);"
-    " CREATE INDEX _recon_pn_norm ON _recon_pn (norm);"
     " ANALYZE _recon_names;"
     " ANALYZE _recon_pn;"
 )
@@ -193,85 +193,105 @@ _INDEX_NAMES_SQL = text(
 # The two candidate-pair sets are UNIONed, self is added (so every name anchors), then a
 # single grouping assigns group_id = smallest anchor_id among linked names. No caps.
 # ---------------------------------------------------------------------------
+# Corroboration that two same/similar-named persons are plausibly the SAME person.
+# STRONG signals are near-unique, so ONE is enough: email, phone, exact address.
+# WEAK signals are low-cardinality (many unrelated people share them), so a single one is
+# NOT enough — two people named "Maria Garcia" both in Madrid are probably different. A
+# weak signal only counts when TWO of them agree together (same city AND same company).
+#   strong  = email | phone | address
+#   weak    = (city AND company)
+_CORROBORATES = """(
+        (pa.email   IS NOT NULL AND pa.email   = pb.email)
+     OR (pa.phone   IS NOT NULL AND pa.phone   = pb.phone)
+     OR (pa.address IS NOT NULL AND pa.address = pb.address)
+     OR (pa.city    IS NOT NULL AND pa.city    = pb.city
+         AND pa.company IS NOT NULL AND pa.company = pb.company)
+)"""
+_PASSPORT_OK = (
+    "NOT (pa.passport IS NOT NULL AND pb.passport IS NOT NULL AND pa.passport <> pb.passport)"
+)
+
+# The reconciliation surfaces PLAUSIBLE same-person pairs (never certain). Three rules,
+# all resolved to PERSON pairs so passport/corroboration can be judged per person:
+#
+#   exact_name  : same normalized name, but only for AMBIGUOUS cases — at least one side
+#                 has NO passport (a person with a passport and complete data is not a
+#                 "maybe" of a same-named other). The pair must share a corroborating
+#                 attribute (email/phone/city/address/company). Homonyms with different
+#                 passports and no shared data (the 1982 "juan ignacio") are NOT grouped.
+#   fuzzy_name  : near-identical names (trigram >= threshold), passports must not contradict.
+#   containment : one name contained in the other, corroborated, passports must not contradict.
+#
+# Name blocking (keyt/key2) still runs over the DISTINCT-name catalog to stay cheap; the
+# resulting name pairs are then expanded to person pairs with the passport/corroboration
+# guards. group_id = min person id among linked persons (anchor). No result caps.
 _DETECT_SQL = text(
-    """
-    WITH typo_pairs AS (
-        -- rule 1: typo/letter-swap. Blocking = given name + first 3 chars of the first
-        -- surname (keyt). This splits huge given-name blocks ("juan" ~20k) into small
-        -- sub-blocks, so the trigram similarity only runs within a tiny candidate set.
-        -- A surname typo past the 3rd char keeps the same keyt. Catches "jean leclerc"/
-        -- "jean leclercq". (Trade-off: a typo within the first 3 surname chars is missed;
-        -- accepted so the job scales on millions of rows.)
+    f"""
+    WITH exact_pairs AS (
+        -- same name, at least one side WITHOUT passport, corroborated, not contradicted.
+        SELECT pa.id AS pid, pb.id AS other, 1.0::float AS sim, 'exact' AS kind
+        FROM _recon_pn pa
+        JOIN _recon_pn pb
+          ON pa.norm = pb.norm
+         AND pa.id <> pb.id
+         AND (pa.passport IS NULL OR pb.passport IS NULL)   -- ambiguous side required
+         AND {_PASSPORT_OK}
+         AND {_CORROBORATES}
+    ),
+    name_pairs AS (
+        -- typo (rule 1) and containment (rule 2) as DISTINCT-name pairs (cheap blocking).
         SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, FALSE AS contain
         FROM _recon_names n
         JOIN _recon_names m
-          ON n.keyt = m.keyt                 -- blocking: given name + surname prefix
-         AND n.norm <> m.norm
+          ON n.keyt = m.keyt AND n.norm <> m.norm
          AND similarity(n.norm, m.norm) >= :threshold
-    ),
-    contain_pairs AS (
-        -- rule 2: containment. Blocking key = first two words (given name + first
-        -- surname). Then the full word-subset test on names of DIFFERENT length.
-        -- IMPORTANT: containment alone ("juan garcia" ⊆ "juan garcia X") would merge every
-        -- unrelated "Juan Garcia <extra>" into one giant group. To stay a *plausible*
-        -- duplicate we REQUIRE a corroborating field: same non-null city OR same non-null
-        -- company. So "octavio ponce" and "octavio ponce gimenez" link only when they also
-        -- share a city/company — i.e. when they're actually likely the same person.
+        UNION ALL
         SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, TRUE AS contain
         FROM _recon_names n
         JOIN _recon_names m
-          ON n.key2 = m.key2                 -- blocking: same given name + first surname
-         AND n.norm <> m.norm
+          ON n.key2 = m.key2 AND n.norm <> m.norm
          AND array_length(n.words, 1) <> array_length(m.words, 1)
          AND (n.words <@ m.words OR m.words <@ n.words)
-         AND (
-              (n.city IS NOT NULL AND n.city = m.city)
-              OR (n.company IS NOT NULL AND n.company = m.company)
-         )
     ),
-    links AS (
-        SELECT a, b, sim, contain FROM typo_pairs
+    name_person_pairs AS (
+        -- expand name pairs to person pairs, applying the passport non-contradiction and
+        -- (for containment) corroboration guards at the person level.
+        SELECT pa.id AS pid, pb.id AS other, np.sim,
+               CASE WHEN np.contain THEN 'contain' ELSE 'fuzzy' END AS kind
+        FROM name_pairs np
+        JOIN _recon_pn pa ON pa.norm = np.a
+        JOIN _recon_pn pb ON pb.norm = np.b
+        WHERE pa.id <> pb.id
+          AND {_PASSPORT_OK}
+          AND (NOT np.contain OR {_CORROBORATES})   -- containment needs corroboration
+    ),
+    all_pairs AS (
+        SELECT pid, other, sim, kind FROM exact_pairs
         UNION ALL
-        SELECT a, b, sim, contain FROM contain_pairs
+        SELECT pid, other, sim, kind FROM name_person_pairs
     ),
-    name_groups AS (
-        SELECT nm.norm,
-               nm.anchor_id,
-               nm.n_persons,
-               nm.city,
-               nm.company,
-               LEAST(nm.anchor_id, COALESCE(min(peer.anchor_id), nm.anchor_id)) AS group_id,
-               max(l.sim) AS fuzzy_sim,
-               bool_or(l.contain) AS has_containment_link,
-               count(l.b) > 0 AS has_link
-        FROM _recon_names nm
-        LEFT JOIN links l ON l.a = nm.norm
-        LEFT JOIN _recon_names peer ON peer.norm = l.b
-        GROUP BY nm.norm, nm.anchor_id, nm.n_persons, nm.city, nm.company
-    ),
-    -- a group is "real" (has duplicates) if it holds MORE THAN ONE PERSON in total,
-    -- whether from the same exact name repeated or from linked name variants.
-    real_groups AS (
-        SELECT group_id
-        FROM name_groups
-        GROUP BY group_id
-        HAVING sum(n_persons) > 1
+    person_groups AS (
+        -- anchor each linked person to the smallest person id it links to.
+        SELECT pid,
+               LEAST(pid, min(other)) AS group_id,
+               max(sim) AS confidence,
+               bool_or(kind = 'contain') AS has_containment,
+               bool_or(kind = 'fuzzy') AS has_fuzzy,
+               bool_or(kind = 'exact') AS has_exact
+        FROM all_pairs
+        GROUP BY pid
     )
     INSERT INTO duplicate_groups (group_id, person_id, confidence, reason, created_at)
-    SELECT g.group_id,
-           p.id AS person_id,
-           round(COALESCE(g.fuzzy_sim, 1.0)::numeric, 3) AS confidence,
+    SELECT group_id,
+           pid AS person_id,
+           round(confidence::numeric, 3) AS confidence,
            CASE
-               WHEN g.has_containment_link THEN 'name_containment + same city/company'
-               WHEN g.city IS NOT NULL AND g.has_link THEN 'fuzzy_name + same city'
-               WHEN g.company IS NOT NULL AND g.has_link THEN 'fuzzy_name + same company'
-               WHEN g.has_link THEN 'fuzzy_name'
-               ELSE 'exact_name'
+               WHEN has_containment THEN 'name_containment + corroborated'
+               WHEN has_fuzzy       THEN 'fuzzy_name'
+               ELSE 'exact_name + corroborated'
            END AS reason,
            now()
-    FROM name_groups g
-    JOIN real_groups r ON r.group_id = g.group_id
-    JOIN _recon_pn p ON p.norm = g.norm
+    FROM person_groups
     """
 )
 

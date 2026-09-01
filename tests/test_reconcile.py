@@ -107,17 +107,17 @@ def test_fuzzy_groups_typo_surname(pg_session_factory):
 
 
 def test_containment_extra_surname_groups(pg_session_factory):
-    """A shorter name contained in a longer one links WHEN a field corroborates.
+    """A shorter name contained in a longer one links WHEN a strong field corroborates.
 
     "octavio ponce" ⊆ "octavio ponce gimenez": trigram similarity is < 0.85, so only the
-    containment rule can link them — and only because they share a city (the corroborating
-    field that keeps containment from merging unrelated homonyms).
+    containment rule can link them — and only because they share a strong corroborating
+    signal (same email) that keeps containment from merging unrelated homonyms.
     """
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:X1", "octavio ponce", city="Madrid")
+        a = _add_person(session, "passport:X1", "octavio ponce", email="op@x.com")
         b = _add_person(
-            session, "name:octavio ponce gimenez", "octavio ponce gimenez", city="Madrid"
+            session, "name:octavio ponce gimenez", "octavio ponce gimenez", email="op@x.com"
         )
         session.commit()
 
@@ -134,15 +134,13 @@ def test_containment_extra_surname_groups(pg_session_factory):
 
 
 def test_containment_without_corroboration_no_group(pg_session_factory):
-    """Containment alone (no shared city/company) must NOT link — avoids homonym pile-ups.
-
-    Two "octavio ponce ..." in DIFFERENT cities are probably different people, so the
-    containment rule requires a corroborating field and should leave them ungrouped.
-    """
+    """Containment with only a WEAK signal (same city alone) must NOT link — a shared city
+    is low-cardinality and unrelated homonyms share it. Requires a strong signal or
+    city+company together."""
     session = pg_session_factory()
     try:
         _add_person(session, "passport:X1", "octavio ponce", city="Madrid")
-        _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez", city="Sevilla")
+        _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez", city="Madrid")
         session.commit()
 
         assert run_reconciliation(session) == 0
@@ -151,11 +149,17 @@ def test_containment_without_corroboration_no_group(pg_session_factory):
 
 
 def test_accents_normalized_together(pg_session_factory):
-    """ "María López" and "Maria Lopez" are the same person (accents stripped)."""
+    """ "María López" and "Maria Lopez" normalize to the same name (accents stripped).
+
+    Same normalized name is only a duplicate CANDIDATE when it is ambiguous: at least one
+    side lacks a passport AND they share a corroborating field. Here both lack a passport
+    and share a city, so they group (exact_name + corroborated).
+    """
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:X1", "María López")
-        b = _add_person(session, "name:maria lopez", "Maria Lopez")
+        # Same email is a STRONG corroborating signal (near-unique).
+        a = _add_person(session, "passport:X1", "María López", email="ml@x.com")
+        b = _add_person(session, "name:maria lopez", "Maria Lopez", email="ml@x.com")
         session.commit()
 
         n = run_reconciliation(session)
@@ -185,7 +189,8 @@ def test_group_anchored_to_min_id(pg_session_factory):
         session.close()
 
 
-def test_same_city_marked_in_reason(pg_session_factory):
+def test_fuzzy_pair_gets_fuzzy_reason(pg_session_factory):
+    """Near-identical surnames (typo) are grouped with the fuzzy_name reason label."""
     session = pg_session_factory()
     try:
         _add_person(session, "passport:X1", "ana gil", city="Madrid")
@@ -195,7 +200,8 @@ def test_same_city_marked_in_reason(pg_session_factory):
         run_reconciliation(session, similarity_threshold=0.6)
 
         reasons = [m.reason for m in session.query(DuplicateGroup).all()]
-        assert any("same city" in r for r in reasons)
+        assert reasons and all(r in _ALLOWED_REASONS for r in reasons)
+        assert any(r == "fuzzy_name" for r in reasons)
     finally:
         session.close()
 
@@ -318,11 +324,9 @@ def test_backfill_populates_norm_name_before_detection(pg_session_factory):
 # Fixed set of allowed reason labels. Reconcile builds `reason` ONLY from these literals
 # via a SQL CASE (see reconcile._DETECT_SQL). No name/passport/city value ever appears.
 _ALLOWED_REASONS = {
-    "exact_name",
+    "exact_name + corroborated",
     "fuzzy_name",
-    "fuzzy_name + same city",
-    "fuzzy_name + same company",
-    "name_containment + same city/company",
+    "name_containment + corroborated",
 }
 
 
@@ -360,8 +364,9 @@ def test_t4_typo_maria_martin_groups(pg_session_factory):
 def test_t7_titles_stripped_group_together(pg_session_factory):
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:T7a", "Dr Juan Perez")
-        b = _add_person(session, "name:juan perez md", "Juan Perez MD")
+        # No passport (ambiguous) + shared phone (strong) corroborates -> exact_name.
+        a = _add_person(session, "passport:T7a", "Dr Juan Perez", phone="600100200")
+        b = _add_person(session, "name:juan perez md", "Juan Perez MD", phone="600100200")
         session.commit()
 
         n = run_reconciliation(session)  # strict default threshold: exact after normalize
@@ -371,7 +376,60 @@ def test_t7_titles_stripped_group_together(pg_session_factory):
         assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
         # Same normalized name -> the reason is the exact-name label.
         reasons = {m.reason for m in session.query(DuplicateGroup).all()}
-        assert "exact_name" in reasons
+        assert any(r.startswith("exact_name") for r in reasons)
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# exact_name is now AMBIGUITY-gated: same normalized name only groups when at
+# least one side lacks a passport AND a corroborating field matches. These two
+# tests pin the new behavior (the fix for the 373k-homonym-group explosion).
+# ----------------------------------------------------------------------
+
+
+def test_exact_name_different_passports_do_not_group(pg_session_factory):
+    """Two same-named people who BOTH have a (different) passport are provably distinct
+    people — a shared name must not group them, even sharing a city."""
+    session = pg_session_factory()
+    try:
+        _add_person(session, "k:dp-1", "juan ignacio", passport="AAA111", city="Madrid")
+        _add_person(session, "k:dp-2", "juan ignacio", passport="BBB222", city="Madrid")
+        session.commit()
+
+        assert run_reconciliation(session) == 0
+    finally:
+        session.close()
+
+
+def test_exact_name_without_corroboration_does_not_group(pg_session_factory):
+    """Same name, one side without passport, but NO shared field (email/phone/city/
+    address/company) -> not enough evidence, so they are not grouped."""
+    session = pg_session_factory()
+    try:
+        _add_person(session, "k:nc-1", "juan ignacio", city="Madrid")  # no passport
+        _add_person(session, "k:nc-2", "juan ignacio", city="Sevilla")  # no passport
+        session.commit()
+
+        assert run_reconciliation(session) == 0
+    finally:
+        session.close()
+
+
+def test_exact_name_missing_passport_with_corroboration_groups(pg_session_factory):
+    """The core ambiguous case: same name, one has a passport and the other does not, and
+    they share a corroborating field (email) -> a plausible duplicate for human review."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:mp-1", "juan ignacio", passport="AAA111", email="ji@x.com")
+        b = _add_person(session, "k:mp-2", "juan ignacio", email="ji@x.com")  # no passport
+        session.commit()
+
+        n = run_reconciliation(session)
+
+        assert n >= 2
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
     finally:
         session.close()
 
