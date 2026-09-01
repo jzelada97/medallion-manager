@@ -227,16 +227,35 @@ _PASSPORT_OK = (
 # guards. group_id = min person id among linked persons (anchor). No result caps.
 _DETECT_SQL = text(
     f"""
-    WITH exact_pairs AS (
-        -- same name, at least one side WITHOUT passport, corroborated, not contradicted.
-        SELECT pa.id AS pid, pb.id AS other, 1.0::float AS sim, 'exact' AS kind
-        FROM _recon_pn pa
-        JOIN _recon_pn pb
-          ON pa.norm = pb.norm
-         AND pa.id <> pb.id
-         AND (pa.passport IS NULL OR pb.passport IS NULL)   -- ambiguous side required
-         AND {_PASSPORT_OK}
-         AND {_CORROBORATES}
+    WITH exact_sig AS (
+        -- one row per (person, corroborating signal it actually has). The signal VALUE is
+        -- the blocking key together with norm; people sharing (norm, signal) are the same
+        -- person candidate. This replaces the O(n^2) per-name self-join with set ops.
+        SELECT id, norm, passport, 'e:' || email AS sig FROM _recon_pn WHERE email IS NOT NULL
+        UNION ALL
+        SELECT id, norm, passport, 'p:' || phone AS sig FROM _recon_pn WHERE phone IS NOT NULL
+        UNION ALL
+        SELECT id, norm, passport, 'a:' || address AS sig FROM _recon_pn WHERE address IS NOT NULL
+        UNION ALL
+        SELECT id, norm, passport, 'cc:' || city || '|' || company AS sig
+        FROM _recon_pn WHERE city IS NOT NULL AND company IS NOT NULL
+    ),
+    exact_blocks AS (
+        -- valid blocks: >=2 people share (norm, signal), at least one WITHOUT passport
+        -- (ambiguous), and no two distinct non-null passports (no contradiction).
+        SELECT norm, sig, min(id) AS anchor
+        FROM exact_sig
+        GROUP BY norm, sig
+        HAVING count(*) > 1
+           AND count(*) FILTER (WHERE passport IS NULL) > 0
+           AND count(DISTINCT passport) <= 1
+    ),
+    exact_pairs AS (
+        -- membership edges: each person in a valid block -> its block anchor.
+        SELECT es.id AS pid, eb.anchor AS other, 1.0::float AS sim, 'exact' AS kind
+        FROM exact_sig es
+        JOIN exact_blocks eb ON eb.norm = es.norm AND eb.sig = es.sig
+        WHERE es.id <> eb.anchor
     ),
     name_pairs AS (
         -- typo (rule 1) and containment (rule 2) as DISTINCT-name pairs (cheap blocking).
@@ -265,10 +284,17 @@ _DETECT_SQL = text(
           AND {_PASSPORT_OK}
           AND (NOT np.contain OR {_CORROBORATES})   -- containment needs corroboration
     ),
-    all_pairs AS (
+    directed AS (
         SELECT pid, other, sim, kind FROM exact_pairs
         UNION ALL
         SELECT pid, other, sim, kind FROM name_person_pairs
+    ),
+    all_pairs AS (
+        -- make edges bidirectional so BOTH members (including the anchor) become a `pid`
+        -- and land in a group; otherwise the anchor row would be missing from its group.
+        SELECT pid, other, sim, kind FROM directed
+        UNION ALL
+        SELECT other AS pid, pid AS other, sim, kind FROM directed
     ),
     person_groups AS (
         -- anchor each linked person to the smallest person id it links to.
