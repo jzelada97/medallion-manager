@@ -84,7 +84,29 @@ def _ensure_pg_trgm(session: Session) -> bool:
 
 
 def _build_links_sql() -> str:
-    """SQL that builds candidate merge links within each repeated passport."""
+    """SQL that builds candidate merge links from TWO complementary sources.
+
+    Both feed the same ``_cm_links`` edge table; the survivorship/transitive-closure/
+    delete pipeline downstream is generic and needs no change.
+
+    VÍA 1 (passport) — same ``passport`` AND similar ``norm_name`` (>= threshold). The
+    original rule: complementary fragments the streaming split under one passport.
+
+    VÍA 2 (identical name, split person) — the big finding from the real 2.2M data:
+    ~203k people were left split into a Location-side row (from ``name:*`` match_key: has
+    address/city/company, NO passport) and a Personal-side row (from ``passport:*``: has
+    passport/email/phone, NO address), carrying the SAME normalized name. The streaming
+    cross-link (Redis alias, exact-name, TTL-bounded) missed them at 2.2M scale. They are
+    the same person, not duplicates. VÍA 2 merges them, tightly gated to stay safe:
+
+      * IDENTICAL ``norm_name`` (not fuzzy — exact after normalization), >= 2 words.
+      * Restricted to name buckets of EXACTLY 2 eligible persons (the validated, clean
+        case). Bigger buckets are left alone for now (may hold real homonyms).
+      * NON-CONTRADICTION of passport: the bucket has <= 1 distinct non-null passport, so
+        the ~44k freq=2 homonyms that carry two DIFFERENT passports are NOT merged.
+      * At least one side must HAVE a passport (the split-person signature); pure
+        passport-less same-name pairs are ambiguous and left for review, not merged.
+    """
     return """
         DROP TABLE IF EXISTS _cm_dup_pass;
         CREATE TEMP TABLE _cm_dup_pass AS
@@ -97,6 +119,7 @@ def _build_links_sql() -> str:
 
         DROP TABLE IF EXISTS _cm_links;
         CREATE TEMP TABLE _cm_links AS
+            -- VÍA 1: same passport + similar name
             SELECT a.id AS id_a, b.id AS id_b
             FROM persons a
             JOIN persons b
@@ -106,6 +129,29 @@ def _build_links_sql() -> str:
              AND b.norm_name IS NOT NULL
             JOIN _cm_dup_pass d ON d.passport = a.passport
             WHERE similarity(a.norm_name, b.norm_name) >= :merge_threshold;
+
+        -- VÍA 2: identical name, freq=2 bucket, <=1 distinct passport, >=1 has passport.
+        -- Build the eligible-name catalog first (cheap GROUP BY), then link the 2 rows.
+        DROP TABLE IF EXISTS _cm_split_names;
+        CREATE TEMP TABLE _cm_split_names AS
+            SELECT norm_name
+            FROM persons
+            WHERE norm_name IS NOT NULL
+              AND length(norm_name) >= 3
+              AND array_length(regexp_split_to_array(norm_name, ' '), 1) >= 2
+            GROUP BY norm_name
+            HAVING count(*) = 2
+               AND count(*) FILTER (WHERE passport IS NOT NULL) >= 1
+               AND count(DISTINCT passport) <= 1;
+        CREATE INDEX _cm_split_names_idx ON _cm_split_names (norm_name);
+
+        INSERT INTO _cm_links (id_a, id_b)
+        SELECT a.id AS id_a, b.id AS id_b
+        FROM persons a
+        JOIN persons b
+          ON a.norm_name = b.norm_name
+         AND a.id < b.id
+        JOIN _cm_split_names s ON s.norm_name = a.norm_name;
     """
 
 

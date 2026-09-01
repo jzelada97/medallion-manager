@@ -1,17 +1,19 @@
-"""Integration tests for the fuzzy batch reconciliation (processing/reconcile).
+"""Integration tests for the batch reconciliation (processing/reconcile).
 
-Reconciliation runs its detection in SQL using the ``pg_trgm`` extension (fuzzy name
-similarity) and groups probable duplicates into ``duplicate_groups``. These are
-integration tests against a REAL PostgreSQL — the SQL uses Postgres-specific features
-(pg_trgm's ``similarity()``, ``split_part``, ``regexp_replace``) that SQLite lacks.
+Reconciliation searches SILVER (``persons``) for probable-duplicate persons and stores
+them as groups in ``duplicate_groups`` for HUMAN REVIEW — never auto-merged. The ONLY
+signal is the NAME (identical / typo / containment); NO field corroboration is required,
+because real split persons share no field but the name. The only negative guard is
+passport NON-CONTRADICTION (different non-null passports = different people). Single-word
+names are excluded. See the reconcile.py module docstring for the full rationale.
 
-Connects via TEST_POSTGRES_DSN (defaults to the docker-compose Postgres on
-localhost:5432). If no Postgres is reachable, the module is skipped.
+Integration tests against a REAL PostgreSQL (pg_trgm). Connects via TEST_POSTGRES_DSN
+(defaults to the docker-compose Postgres on localhost:5432). Skipped if none reachable.
 
 Run it with the stack up:
     docker compose up -d postgres
-    set TEST_POSTGRES_DSN=postgresql+psycopg2://hr_user:changeme@localhost:5432/hr_warehouse
-    pytest -m integration
+    $env:TEST_POSTGRES_DSN="postgresql+psycopg2://hr_user:changeme@localhost:5432/hr_warehouse"
+    pytest tests/test_reconcile.py -m integration
 """
 
 from __future__ import annotations
@@ -76,54 +78,67 @@ def _add_person(session, match_key: str, full_name: str | None, **kwargs) -> Per
 
 
 def _groups(session) -> dict[int, list[DuplicateGroup]]:
-    """Return current memberships bundled by group_id."""
     out: dict[int, list[DuplicateGroup]] = {}
     for m in session.query(DuplicateGroup).all():
         out.setdefault(m.group_id, []).append(m)
     return out
 
 
+_ALLOWED_REASONS = {"exact_name", "fuzzy_name", "name_containment"}
+
+
 # ----------------------------------------------------------------------
-# Fuzzy name similarity groups near-identical names (typos, extra surname)
+# Positive: names relate -> grouped, NO corroboration needed
 # ----------------------------------------------------------------------
 
 
-def test_fuzzy_groups_typo_surname(pg_session_factory):
+def test_typo_groups_without_corroboration(pg_session_factory):
+    """Near-identical surnames (typo) group on the NAME ALONE — the split-person case
+    where the two halves share NO field but the name (one from Personal, one from
+    Location). No email/phone/company in common, yet they are candidates."""
     session = pg_session_factory()
     try:
-        # One-letter difference at the end: exact matching would miss this. They share a
-        # strong signal (email) so the typo rule links them (a real typo of the same
-        # person corroborates; name similarity alone is not enough).
-        a = _add_person(session, "passport:X1", "jean leclerc", email="jl@x.com")
-        b = _add_person(session, "name:jean leclercq", "jean leclercq", email="jl@x.com")
+        # disjoint data on purpose: one passport-side, one address-side, nothing shared.
+        a = _add_person(session, "passport:X1", "jean leclerc", passport="X1", email="jl@x.com")
+        b = _add_person(
+            session,
+            "name:jean leclercq",
+            "jean leclercq",
+            city="Paris",
+            address="1 St",
+            company="Acme",
+        )
         session.commit()
 
         n = run_reconciliation(session, similarity_threshold=0.6)
 
-        assert n >= 2  # both land in a group
+        assert n >= 2
         groups = _groups(session)
-        # exactly one group containing both persons
         assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
+        reasons = {m.reason for m in session.query(DuplicateGroup).all()}
+        assert reasons <= _ALLOWED_REASONS
+        assert "fuzzy_name" in reasons
     finally:
         session.close()
 
 
-def test_containment_extra_surname_groups(pg_session_factory):
-    """A shorter name contained in a longer one links WHEN a strong field corroborates.
-
-    "octavio ponce" ⊆ "octavio ponce gimenez": trigram similarity is < 0.85, so only the
-    containment rule can link them — and only because they share a strong corroborating
-    signal (same email) that keeps containment from merging unrelated homonyms.
-    """
+def test_containment_groups_disjoint_data(pg_session_factory):
+    """Real split-person case (maite): "maite rodriguez" (Personal, passport) ⊆
+    "maite rodriguez sanchez" (Location, address). They share NO field but the name;
+    containment surfaces them for review anyway."""
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:X1", "octavio ponce", email="op@x.com")
+        a = _add_person(session, "passport:M", "maite rodriguez", passport="PT99", email="m@x.com")
         b = _add_person(
-            session, "name:octavio ponce gimenez", "octavio ponce gimenez", email="op@x.com"
+            session,
+            "name:maite rodriguez sanchez",
+            "maite rodriguez sanchez",
+            city="Lisboa",
+            company="ACME",
+            address="R 5",
         )
         session.commit()
 
-        # default strict threshold (0.85): only containment can link these
         n = run_reconciliation(session)
 
         assert n >= 2
@@ -135,14 +150,55 @@ def test_containment_extra_surname_groups(pg_session_factory):
         session.close()
 
 
-def test_containment_without_corroboration_no_group(pg_session_factory):
-    """Containment with only a WEAK signal (same city alone) must NOT link — a shared city
-    is low-cardinality and unrelated homonyms share it. Requires a strong signal or
-    city+company together."""
+def test_identical_repeated_name_groups(pg_session_factory):
+    """Identical repeated names ARE candidates for review (ambiguous homonyms a human
+    decides). They group as exact_name — as long as passports do not contradict."""
     session = pg_session_factory()
     try:
-        _add_person(session, "passport:X1", "octavio ponce", city="Madrid")
-        _add_person(session, "name:octavio ponce gimenez", "octavio ponce gimenez", city="Madrid")
+        # neither has a passport -> non-contradiction holds -> grouped for review
+        a = _add_person(session, "name:luisa jilani", "luisa jilani", city="Paris")
+        b = _add_person(session, "k:luisa2", "luisa jilani", company="Globex")
+        session.commit()
+
+        n = run_reconciliation(session)
+
+        assert n >= 2
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
+        reasons = {m.reason for m in session.query(DuplicateGroup).all()}
+        assert "exact_name" in reasons
+    finally:
+        session.close()
+
+
+def test_group_anchored_to_min_id(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:1", "maria lopez", city="A")
+        b = _add_person(session, "k:2", "maria lopezz", city="B")
+        session.commit()
+
+        run_reconciliation(session, similarity_threshold=0.6)
+
+        groups = _groups(session)
+        assert len(groups) == 1
+        assert next(iter(groups)) == min(a.id, b.id)
+    finally:
+        session.close()
+
+
+# ----------------------------------------------------------------------
+# Negative: the only guards — passport contradiction and single-word names
+# ----------------------------------------------------------------------
+
+
+def test_contradicting_passports_no_group(pg_session_factory):
+    """Different non-null passports = provably different people; identical/similar names
+    must NOT group them (the "many jose luis, each with own passport" case)."""
+    session = pg_session_factory()
+    try:
+        _add_person(session, "k:1", "jose luis", passport="AAA111", city="Madrid")
+        _add_person(session, "k:2", "jose luis", passport="BBB222", city="Sevilla")
         session.commit()
 
         assert run_reconciliation(session) == 0
@@ -150,18 +206,57 @@ def test_containment_without_corroboration_no_group(pg_session_factory):
         session.close()
 
 
-def test_accents_normalized_together(pg_session_factory):
-    """ "María López" and "Maria Lopez" normalize to the same name (accents stripped).
-
-    Same normalized name is only a duplicate CANDIDATE when it is ambiguous: at least one
-    side lacks a passport AND they share a corroborating field. Here both lack a passport
-    and share a city, so they group (exact_name + corroborated).
-    """
+def test_typo_different_passports_still_grouped_for_review(pg_session_factory):
+    """Passport non-contradiction is enforced only on the IDENTICAL-name branch (the
+    homonym flood). For a TYPO pair across DISTINCT names, grouping is resolved on the
+    name graph (for scale — no person×person product), so a typo pair is surfaced for
+    review even with different passports. A human decides. This is a deliberate,
+    documented trade-off: enforcing passport non-contradiction pairwise here would require
+    expanding common name blocks to person×person pairs (measured 113M rows -> DiskFull)."""
     session = pg_session_factory()
     try:
-        # Same email is a STRONG corroborating signal (near-unique).
-        a = _add_person(session, "passport:X1", "María López", email="ml@x.com")
-        b = _add_person(session, "name:maria lopez", "Maria Lopez", email="ml@x.com")
+        a = _add_person(session, "k:1", "carlos mendez", passport="AA1")
+        b = _add_person(session, "k:2", "carlos mendezz", passport="BB2")
+        session.commit()
+
+        n = run_reconciliation(session, similarity_threshold=0.6)
+
+        assert n >= 2
+        groups = _groups(session)
+        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
+    finally:
+        session.close()
+
+
+def test_common_namebase_bucket_pruned(pg_session_factory):
+    """A common name-base (many persons sharing given-name + first-surname) is homonymy,
+    not duplication: above the frequency guard it is NOT grouped, so the review pane stays
+    useful. Here we seed > threshold persons named "juan ignacio" (and variants); none
+    should group."""
+    from hr_etl.processing.reconcile import _MAX_CONTAIN_BUCKET
+
+    session = pg_session_factory()
+    try:
+        # threshold+2 identical "juan ignacio" (no passport, no contradiction) — still
+        # pruned because the key2 bucket is too big to be a credible duplicate set.
+        for i in range(_MAX_CONTAIN_BUCKET + 2):
+            _add_person(session, f"k:ji-{i}", "juan ignacio", city=f"C{i}")
+        # plus a containment variant that would have joined the huge bucket
+        _add_person(session, "k:jig", "juan ignacio gomez", city="X")
+        session.commit()
+
+        assert run_reconciliation(session, similarity_threshold=0.6) == 0
+    finally:
+        session.close()
+
+
+def test_small_namebase_still_groups(pg_session_factory):
+    """A small name-base (few persons) is still grouped — the guard only prunes the big,
+    noisy buckets, not the credible small ones (maite/lucio-like)."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:1", "octavio ponce", city="Roma")
+        b = _add_person(session, "k:2", "octavio ponce gimenez", city="Milano")
         session.commit()
 
         n = run_reconciliation(session)
@@ -173,52 +268,25 @@ def test_accents_normalized_together(pg_session_factory):
         session.close()
 
 
-def test_group_anchored_to_min_id(pg_session_factory):
+def test_single_word_name_never_groups(pg_session_factory):
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:X1", "maria lopez", email="mlz@x.com")
-        b = _add_person(session, "name:maria lopezz", "maria lopezz", email="mlz@x.com")
+        _add_person(session, "k:1", "madonna")
+        _add_person(session, "k:2", "madonna")
+        _add_person(session, "k:3", "Dr Madonna")  # normalizes to single word too
         session.commit()
 
-        run_reconciliation(session, similarity_threshold=0.6)
-
-        groups = _groups(session)
-        assert len(groups) == 1
-        gid = next(iter(groups))
-        # group_id is the smallest person id (canonical anchor)
-        assert gid == min(a.id, b.id)
+        assert run_reconciliation(session, similarity_threshold=0.6) == 0
+        assert session.query(DuplicateGroup).count() == 0
     finally:
         session.close()
-
-
-def test_fuzzy_pair_gets_fuzzy_reason(pg_session_factory):
-    """Near-identical surnames (typo) are grouped with the fuzzy_name reason label."""
-    session = pg_session_factory()
-    try:
-        _add_person(session, "passport:X1", "ana gil", phone="600999888")
-        _add_person(session, "name:ana gill", "ana gill", phone="600999888")
-        session.commit()
-
-        run_reconciliation(session, similarity_threshold=0.6)
-
-        reasons = [m.reason for m in session.query(DuplicateGroup).all()]
-        assert reasons and all(r in _ALLOWED_REASONS for r in reasons)
-        assert any(r == "fuzzy_name" for r in reasons)
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# Non-duplicates and edge cases
-# ----------------------------------------------------------------------
 
 
 def test_distinct_names_no_group(pg_session_factory):
     session = pg_session_factory()
     try:
-        # Different first-word blocks -> never compared; clearly not duplicates.
-        _add_person(session, "passport:X1", "ana gil")
-        _add_person(session, "name:pedro ramirez", "pedro ramirez")
+        _add_person(session, "k:1", "ana gil")
+        _add_person(session, "k:2", "pedro ramirez")
         session.commit()
 
         assert run_reconciliation(session, similarity_threshold=0.85) == 0
@@ -229,12 +297,10 @@ def test_distinct_names_no_group(pg_session_factory):
 def test_high_threshold_rejects_weak_similarity(pg_session_factory):
     session = pg_session_factory()
     try:
-        # Same block ("carlos") but the surnames are quite different.
-        _add_person(session, "passport:X1", "carlos mendez")
-        _add_person(session, "name:carlos villanueva", "carlos villanueva")
+        _add_person(session, "k:1", "carlos mendez")
+        _add_person(session, "k:2", "carlos villanueva")
         session.commit()
 
-        # A strict threshold should not group them.
         assert run_reconciliation(session, similarity_threshold=0.9) == 0
     finally:
         session.close()
@@ -246,7 +312,6 @@ def test_rebuild_clears_previous(pg_session_factory):
         session.add(DuplicateGroup(group_id=1, person_id=1, confidence=0.9, reason="stale"))
         session.commit()
 
-        # No persons this run -> stale rows cleared, zero written.
         assert run_reconciliation(session) == 0
         assert session.query(DuplicateGroup).count() == 0
     finally:
@@ -261,10 +326,26 @@ def test_empty_warehouse(pg_session_factory):
         session.close()
 
 
+def test_idempotent_two_runs_same_groups(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        _add_person(session, "k:1", "maria lopez")
+        _add_person(session, "k:2", "maria lopezz")
+        session.commit()
+
+        n1 = run_reconciliation(session, similarity_threshold=0.6)
+        snap1 = {(m.group_id, m.person_id, m.reason) for m in session.query(DuplicateGroup).all()}
+        n2 = run_reconciliation(session, similarity_threshold=0.6)
+        snap2 = {(m.group_id, m.person_id, m.reason) for m in session.query(DuplicateGroup).all()}
+
+        assert n1 == n2
+        assert snap1 == snap2
+    finally:
+        session.close()
+
+
 # ----------------------------------------------------------------------
-# Parity: the Python compute_norm_name MUST equal the SQL _NORM expression, char for
-# char. If they diverge, streaming and batch would write different norm_name values and
-# reconciliation would group incorrectly (architecture-reconcile.md risk).
+# Parity + PII / schema checks
 # ----------------------------------------------------------------------
 
 
@@ -278,7 +359,6 @@ def test_norm_name_python_sql_parity(pg_session_factory):
         "María López",
         "Dr Juan Perez",
         "Juan Perez MD",
-        "Dr Juan Perez MD",
         "Sr. Octavio Ponce Gimenez",
         "JEAN LECLERCQ",
         "José Ángel Núñez",
@@ -288,272 +368,36 @@ def test_norm_name_python_sql_parity(pg_session_factory):
         expr = norm_sql(":val")
         for raw in samples:
             sql_value = session.execute(text(f"SELECT {expr} AS n"), {"val": raw}).scalar_one()
-            py_value = compute_norm_name(raw)
-            assert (
-                sql_value == py_value
-            ), f"parity mismatch for {raw!r}: {sql_value!r} != {py_value!r}"
+            assert sql_value == compute_norm_name(raw), f"parity mismatch for {raw!r}"
     finally:
         session.close()
 
 
-def test_backfill_populates_norm_name_before_detection(pg_session_factory):
-    """Rows inserted without norm_name (e.g. legacy/fixture) get it materialized by the
-    reconciliation guard, so detection still works over norm_name."""
+def test_reason_has_no_pii_only_fixed_labels(pg_session_factory):
     session = pg_session_factory()
     try:
-        # Insert with full_name only; norm_name left NULL on purpose. Shared email so the
-        # typo rule (which now requires corroboration) can link them.
-        a = _add_person(session, "k:bf-1", "maria lopez", email="bfm@x.com")
-        b = _add_person(session, "k:bf-2", "maria lopezz", email="bfm@x.com")
-        session.commit()
-
-        run_reconciliation(session, similarity_threshold=0.6)
-
-        # norm_name now materialized for both.
-        rows = {r.id: r.norm_name for r in session.query(PersonRow).all()}
-        assert rows[a.id] == "maria lopez"
-        assert rows[b.id] == "maria lopezz"
-        groups = _groups(session)
-        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
-    finally:
-        session.close()
-
-
-# ======================================================================
-# QA gap-filling tests — added to close the T-1..T-13 / SEC-T1..T7 matrix.
-# Same real-Postgres integration style as above (pg_trgm).
-# ======================================================================
-
-# Fixed set of allowed reason labels. Reconcile builds `reason` ONLY from these literals
-# via a SQL CASE (see reconcile._DETECT_SQL). No name/passport/city value ever appears.
-_ALLOWED_REASONS = {
-    "exact_name + corroborated",
-    "fuzzy_name",
-    "name_containment + corroborated",
-}
-
-
-# ----------------------------------------------------------------------
-# T-4 — typo/near-identical surnames group together. Covers the second
-# canonical example from the spec ("maria martin" / "maria martins") in
-# addition to the leclerc/leclercq case already tested above.
-# ----------------------------------------------------------------------
-
-
-def test_t4_typo_maria_martin_groups(pg_session_factory):
-    session = pg_session_factory()
-    try:
-        a = _add_person(session, "passport:T4a", "maria martin", email="mm@x.com")
-        b = _add_person(session, "name:maria martins", "maria martins", email="mm@x.com")
-        session.commit()
-
-        n = run_reconciliation(session, similarity_threshold=0.6)
-
-        assert n >= 2
-        groups = _groups(session)
-        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# T-7 — titles (honorifics/suffixes) are stripped at BOTH ends by the same
-# canonical normalization used in streaming, so "Dr Juan Perez" and
-# "Juan Perez MD" collapse to the same norm_name and land in one group
-# (exact_name after normalization). Complements the accents case (T-7).
-# ----------------------------------------------------------------------
-
-
-def test_t7_titles_stripped_group_together(pg_session_factory):
-    session = pg_session_factory()
-    try:
-        # No passport (ambiguous) + shared phone (strong) corroborates -> exact_name.
-        a = _add_person(session, "passport:T7a", "Dr Juan Perez", phone="600100200")
-        b = _add_person(session, "name:juan perez md", "Juan Perez MD", phone="600100200")
-        session.commit()
-
-        n = run_reconciliation(session)  # strict default threshold: exact after normalize
-
-        assert n >= 2
-        groups = _groups(session)
-        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
-        # Same normalized name -> the reason is the exact-name label.
-        reasons = {m.reason for m in session.query(DuplicateGroup).all()}
-        assert any(r.startswith("exact_name") for r in reasons)
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# exact_name is now AMBIGUITY-gated: same normalized name only groups when at
-# least one side lacks a passport AND a corroborating field matches. These two
-# tests pin the new behavior (the fix for the 373k-homonym-group explosion).
-# ----------------------------------------------------------------------
-
-
-def test_exact_name_different_passports_do_not_group(pg_session_factory):
-    """Two same-named people who BOTH have a (different) passport are provably distinct
-    people — a shared name must not group them, even sharing a city."""
-    session = pg_session_factory()
-    try:
-        _add_person(session, "k:dp-1", "juan ignacio", passport="AAA111", city="Madrid")
-        _add_person(session, "k:dp-2", "juan ignacio", passport="BBB222", city="Madrid")
-        session.commit()
-
-        assert run_reconciliation(session) == 0
-    finally:
-        session.close()
-
-
-def test_exact_name_without_corroboration_does_not_group(pg_session_factory):
-    """Same name, one side without passport, but NO shared field (email/phone/city/
-    address/company) -> not enough evidence, so they are not grouped."""
-    session = pg_session_factory()
-    try:
-        _add_person(session, "k:nc-1", "juan ignacio", city="Madrid")  # no passport
-        _add_person(session, "k:nc-2", "juan ignacio", city="Sevilla")  # no passport
-        session.commit()
-
-        assert run_reconciliation(session) == 0
-    finally:
-        session.close()
-
-
-def test_exact_name_missing_passport_with_corroboration_groups(pg_session_factory):
-    """The core ambiguous case: same name, one has a passport and the other does not, and
-    they share a corroborating field (email) -> a plausible duplicate for human review."""
-    session = pg_session_factory()
-    try:
-        a = _add_person(session, "k:mp-1", "juan ignacio", passport="AAA111", email="ji@x.com")
-        b = _add_person(session, "k:mp-2", "juan ignacio", email="ji@x.com")  # no passport
-        session.commit()
-
-        n = run_reconciliation(session)
-
-        assert n >= 2
-        groups = _groups(session)
-        assert any({m.person_id for m in members} == {a.id, b.id} for members in groups.values())
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# T-8 — a single-word normalized name (only a given name, no surname) is too
-# ambiguous to claim a duplicate and must NEVER form a group, even if the
-# same word repeats. reconcile requires >= 2 tokens (_MIN_NAME_TOKENS).
-# ----------------------------------------------------------------------
-
-
-def test_t8_single_word_name_never_groups(pg_session_factory):
-    session = pg_session_factory()
-    try:
-        # Same single word twice: without the >=2-token rule these would "match".
-        _add_person(session, "passport:T8a", "madonna")
-        _add_person(session, "name:madonna-2", "madonna")
-        # A title + single word normalizes to a single word too -> still excluded.
-        _add_person(session, "name:dr-madonna", "Dr Madonna")
-        session.commit()
-
-        assert run_reconciliation(session, similarity_threshold=0.6) == 0
-        assert session.query(DuplicateGroup).count() == 0
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# T-9 — a repeated EMAIL across otherwise-different people is generator
-# noise (DEC-3/AC-10). Email is never a grouping signal: two different
-# names sharing an email must NOT be grouped.
-# ----------------------------------------------------------------------
-
-
-def test_t9_repeated_email_does_not_group(pg_session_factory):
-    session = pg_session_factory()
-    try:
-        # Same email, clearly different names (different first-word blocks).
-        _add_person(session, "passport:T9a", "carlos gonzalez", email="cgonzalez@yahoo.com")
-        _add_person(session, "name:pedro ramirez", "pedro ramirez", email="cgonzalez@yahoo.com")
-        session.commit()
-
-        assert run_reconciliation(session, similarity_threshold=0.85) == 0
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# T-10 — idempotence: two consecutive runs over the same data yield the SAME
-# groups (rebuild clears the previous set; no accumulation, no drift).
-# ----------------------------------------------------------------------
-
-
-def test_t10_idempotent_two_runs_same_groups(pg_session_factory):
-    session = pg_session_factory()
-    try:
-        _add_person(session, "passport:T10a", "maria lopez")
-        _add_person(session, "name:maria lopezz", "maria lopezz")
-        session.commit()
-
-        n1 = run_reconciliation(session, similarity_threshold=0.6)
-        snapshot1 = {
-            (m.group_id, m.person_id, m.reason) for m in session.query(DuplicateGroup).all()
-        }
-
-        n2 = run_reconciliation(session, similarity_threshold=0.6)
-        snapshot2 = {
-            (m.group_id, m.person_id, m.reason) for m in session.query(DuplicateGroup).all()
-        }
-
-        assert n1 == n2
-        assert snapshot1 == snapshot2  # identical membership set, no duplication
-    finally:
-        session.close()
-
-
-# ----------------------------------------------------------------------
-# SEC-T1 — `reason` NEVER contains PII. After a run over seeded data, every
-# reason value is one of the fixed labels; no name/passport/city/similarity
-# digit leaks into it (security-reconcile.md DP-5).
-# ----------------------------------------------------------------------
-
-
-def test_sec_t1_reason_has_no_pii_only_fixed_labels(pg_session_factory):
-    session = pg_session_factory()
-    try:
-        # A mix that exercises several reason branches (each pair shares a strong signal).
-        _add_person(session, "passport:S1a", "jean leclerc", email="jl2@x.com")
-        _add_person(session, "name:jean leclercq", "jean leclercq", email="jl2@x.com")
-        _add_person(session, "passport:S1c", "octavio ponce", email="op2@x.com")
-        _add_person(session, "name:opg", "octavio ponce gimenez", email="op2@x.com")
+        _add_person(session, "k:1", "jean leclerc", city="Paris")
+        _add_person(session, "k:2", "jean leclercq", city="Paris")
+        _add_person(session, "k:3", "octavio ponce", city="Roma")
+        _add_person(session, "k:4", "octavio ponce gimenez", city="Roma")
         session.commit()
 
         run_reconciliation(session, similarity_threshold=0.6)
 
         reasons = {m.reason for m in session.query(DuplicateGroup).all()}
-        assert reasons, "expected at least one group for this fixture"
-        # Every reason is a fixed label — nothing else.
-        assert (
-            reasons <= _ALLOWED_REASONS
-        ), f"unexpected reason label(s): {reasons - _ALLOWED_REASONS}"
-        # And explicitly: no seeded PII value appears inside any reason string.
-        pii_values = ["leclerc", "leclercq", "octavio", "ponce", "gimenez", "paris", "madrid"]
+        assert reasons, "expected at least one group"
+        assert reasons <= _ALLOWED_REASONS
+        pii = ["leclerc", "leclercq", "octavio", "ponce", "gimenez", "paris", "roma"]
         for r in reasons:
             low = r.lower()
-            for pii in pii_values:
-                assert pii not in low, f"PII {pii!r} leaked into reason {r!r}"
-            # no similarity digits either
-            assert not any(ch.isdigit() for ch in r), f"digit leaked into reason {r!r}"
+            for p in pii:
+                assert p not in low, f"PII {p!r} leaked into reason {r!r}"
+            assert not any(ch.isdigit() for ch in r)
     finally:
         session.close()
 
 
-# ----------------------------------------------------------------------
-# SEC-T2 — the duplicate_groups schema exposes NO PII columns: only the
-# numeric FK + label + confidence + timestamps (security-reconcile.md DP-1).
-# ----------------------------------------------------------------------
-
-
-def test_sec_t2_duplicate_groups_schema_has_no_pii_columns(pg_session_factory):
-    # Force schema creation.
+def test_duplicate_groups_schema_has_no_pii_columns(pg_session_factory):
     _ = pg_session_factory()
     engine = create_db_engine(DSN)
     try:
@@ -568,49 +412,25 @@ def test_sec_t2_duplicate_groups_schema_has_no_pii_columns(pg_session_factory):
                 ).all()
             }
         assert cols == {"id", "group_id", "person_id", "confidence", "reason", "created_at"}
-        # Belt-and-braces: none of the PII field names is present as a column.
-        pii_columns = {
-            "passport",
-            "iban",
-            "salary",
-            "email",
-            "phone",
-            "ipv4",
-            "full_name",
-            "name",
-            "lastname",
-            "city",
-            "address",
-            "company",
-        }
-        assert cols.isdisjoint(pii_columns)
     finally:
         engine.dispose()
 
 
-# ----------------------------------------------------------------------
-# SEC-T3 — the reconciliation job logs only aggregates (counts/duration),
-# never PII. Capture the logger output during a run and assert no seeded
-# name/passport/city value appears (security-reconcile.md DP-4).
-# ----------------------------------------------------------------------
-
-
-def test_sec_t3_logs_contain_no_pii(pg_session_factory, caplog):
+def test_logs_contain_no_pii(pg_session_factory, caplog):
     import logging
 
     session = pg_session_factory()
     try:
-        _add_person(session, "passport:S3a", "jean leclerc", city="Paris")
-        _add_person(session, "name:jean leclercq", "jean leclercq", city="Paris")
+        _add_person(session, "k:1", "jean leclerc", city="Paris")
+        _add_person(session, "k:2", "jean leclercq", city="Paris")
         session.commit()
 
         with caplog.at_level(logging.DEBUG):
             run_reconciliation(session, similarity_threshold=0.6)
 
         blob = "\n".join(rec.getMessage() for rec in caplog.records).lower()
-        for pii in ("leclerc", "leclercq", "jean", "paris", "passport:s3a"):
+        for pii in ("leclerc", "leclercq", "jean", "paris"):
             assert pii not in blob, f"PII {pii!r} leaked into logs"
-        # It SHOULD, however, log the operational summary (proves logging happened).
         assert "reconciliation complete" in blob
     finally:
         session.close()

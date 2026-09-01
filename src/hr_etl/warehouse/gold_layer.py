@@ -15,8 +15,16 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from hr_etl.logging_conf import get_logger
+from hr_etl.processing.sql_norm import norm_sql
 
 logger = get_logger(__name__)
+
+# Guarded norm_name backfill (same canonical expression as streaming/reconcile). Fills only
+# rows that have a full_name but no norm_name yet; a no-op once populated.
+_BACKFILL_NORM_SQL = (
+    f"UPDATE persons SET norm_name = {norm_sql('full_name')} "
+    "WHERE full_name IS NOT NULL AND (norm_name IS NULL OR norm_name = '');"
+)
 
 # SQL statements to create Gold views/tables.
 # Using materialized-style approach: real tables that get TRUNCATE + INSERT on refresh.
@@ -73,12 +81,31 @@ _FILLED_COUNT = " + ".join(
     f"(CASE WHEN {f} IS NOT NULL THEN 1 ELSE 0 END)" for f in _COMPLETENESS_FIELDS
 )
 
-# Gold membership predicate (DEC-5): the 5 business-critical fields present AND at least
-# 7 of 8 data fields filled (>= 80%). Applied to the Silver `persons` table on rebuild.
+# Gold membership predicate (DEC-5 + name-uniqueness gate):
+#   * the 5 business-critical fields present AND >= 7 of 8 data fields filled (>= 80%), AND
+#   * the person's ``norm_name`` is UNIQUE across the whole Silver ``persons`` table.
+#
+# The second clause is the key rule (per the spec: "a Gold record must not have a repeated
+# name"). It is checked DIRECTLY against Silver — NOT via ``duplicate_groups`` — on purpose:
+# reconcile prunes common name-bases with a frequency guard (to keep the review pane small),
+# so ``duplicate_groups`` does NOT list every repeated name. Gating Gold on it would let
+# common repeated names ("juan ignacio" x thousands) slip into Gold. Checking uniqueness
+# straight against ``persons`` is the correct, guard-independent guarantee: if a norm_name
+# appears on more than one Silver row, none of them are Gold — we never risk promoting a
+# row whose five fields might actually belong to two different people. Independent of
+# reconcile, so it holds regardless of the maintenance DAG order.
+#
+# The uniqueness test uses a correlated NOT EXISTS (anti-join), backed by the btree index
+# ``ix_persons_norm_name``. (An earlier `id NOT IN (SELECT ...)` variant against
+# duplicate_groups planned as a per-row SubPlan over 859k rows — cost ~1.1e10, > 8 min;
+# NOT EXISTS plans as a Hash Anti Join.) `persons` is aliased `p` in the rebuild.
 _GOLD_PREDICATE = (
-    "full_name IS NOT NULL AND passport IS NOT NULL AND email IS NOT NULL "
-    "AND city IS NOT NULL AND company IS NOT NULL "
-    f"AND ({_FILLED_COUNT}) >= 7"
+    "p.full_name IS NOT NULL AND p.passport IS NOT NULL AND p.email IS NOT NULL "
+    "AND p.city IS NOT NULL AND p.company IS NOT NULL "
+    f"AND ({_FILLED_COUNT}) >= 7 "
+    "AND p.norm_name IS NOT NULL "
+    "AND NOT EXISTS (SELECT 1 FROM persons p2 "
+    "                WHERE p2.norm_name = p.norm_name AND p2.id <> p.id)"
 )
 
 # Rebuild gold_persons: only records that clear the Gold bar. Full DELETE + INSERT so it
@@ -95,7 +122,7 @@ SELECT
     company, company_address, company_phone, company_email, job, iban, salary, ipv4,
     ({_FILLED_COUNT})::FLOAT / 8.0 AS completeness,
     NOW()
-FROM persons
+FROM persons p
 WHERE {_GOLD_PREDICATE};
 """
 
@@ -180,8 +207,14 @@ def refresh_gold(engine: Engine) -> int:
 
     Fully idempotent (DELETE + INSERT). Returns the number of Gold persons for metrics.
     Designed to be called periodically or after a batch of consolidations.
+
+    The name-uniqueness gate needs ``norm_name`` populated; it is normally materialized by
+    streaming + reconcile, but we run a guarded backfill first so refresh_gold is correct
+    on its own (e.g. right after a fresh load, or in tests) and never silently drops a row
+    just because its norm_name was not yet computed. WHERE-indexed no-op once populated.
     """
     with engine.begin() as conn:
+        conn.execute(text(_BACKFILL_NORM_SQL))
         conn.execute(text(_REBUILD_GOLD_PERSONS))
         conn.execute(text(_REFRESH_STATS))
         conn.execute(text(_REFRESH_TOP_CITIES))

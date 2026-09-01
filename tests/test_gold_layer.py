@@ -281,3 +281,51 @@ def test_t12_gold_persons_membership_and_stats(pg_engine):
     assert gold_count == 1
     assert stats_total == 1  # stats computed over gold_persons agree with its cardinality
     assert stored == pytest.approx(1.0)  # 8/8 fields -> completeness 1.0
+
+
+def test_repeated_name_excluded_from_gold(pg_engine):
+    """The name-uniqueness gate, checked directly against Silver: a fully-complete person
+    whose norm_name appears on MORE THAN ONE persons row must NOT reach Gold — we cannot be
+    sure its five fields belong to a single real person. Crucially this does NOT depend on
+    duplicate_groups (which reconcile prunes with a frequency guard); it checks persons
+    directly, so even a common repeated name is kept out of Gold."""
+    init_gold_schema(pg_engine)
+    prefix = uuid.uuid4().hex[:6]
+    from hr_etl.processing.normalizer import compute_norm_name
+    from hr_etl.warehouse.engine import make_session_factory
+
+    def _complete(mk, full_name, **ov):
+        base = dict(
+            match_key=mk,
+            full_name=full_name,
+            norm_name=compute_norm_name(full_name),
+            passport="P",
+            city="madrid",
+            company="acme",
+            iban="ES",
+            email="e@x.com",
+            phone="600",
+            ipv4="1.1.1.1",
+        )
+        base.update(ov)
+        return PersonRow(**base)
+
+    session = make_session_factory(pg_engine)()
+    try:
+        # unique name -> Gold
+        unique = _complete(f"passport:{prefix}-u", "ana gil", passport="P1", email="a@x.com")
+        # two complete persons sharing the SAME norm_name -> neither is Gold
+        dupe_a = _complete(f"passport:{prefix}-d1", "bea ruiz", passport="P2", email="b1@x.com")
+        dupe_b = _complete(f"passport:{prefix}-d2", "Bea Ruiz", passport="P3", email="b2@x.com")
+        session.add_all([unique, dupe_a, dupe_b])
+        session.commit()
+        unique_id = unique.id
+    finally:
+        session.close()
+
+    refresh_gold(pg_engine)
+
+    with pg_engine.connect() as conn:
+        ids = [r.id for r in conn.execute(text("SELECT id FROM gold_persons ORDER BY id"))]
+
+    assert ids == [unique_id]  # only the unique-named person is Gold; the two dupes excluded

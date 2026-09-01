@@ -306,7 +306,13 @@ Detalle menor: algunos nombres del generador contienen dobles espacios (ej: `"Um
 Se guardan tal cual en el warehouse; la normalizacion de keys los colapsa para el matching pero el
 valor persistido conserva el original.
 
-### Batch Reconciliation (match_candidates)
+### Batch Reconciliation (historia — ver la seccion final para la regla VIGENTE)
+
+> ⚠️ Esta seccion describe una version PREVIA del reconciliador (dos fases, exacto+difuso,
+> B1/B2, corroboracion). La **regla vigente** esta en "Subsistema Duplicados / Consolidacion
+> / Gold" mas abajo: reconcile agrupa en Silver SOLO por nombre (identico/typo/contencion),
+> **sin corroboracion**, con no-contradiccion de passport como unica guarda; Gold excluye a
+> los nombres ambiguos. Se conserva esta narrativa por su valor de "como llegamos aqui".
 
 Para abordar los casos ambiguos donde el matching en streaming no puede decidir, implementamos un
 **job batch de reconciliacion** que analiza el warehouse y **agrupa** registros que
@@ -377,30 +383,57 @@ diverjan. Indices: btree (`ix_persons_norm_name`) para el JOIN/GROUP BY y GIN tr
 backfill de las filas historicas). La migracion la ejecuta `init_schema` de forma
 idempotente (se salta en backends no-Postgres).
 
-**1. Fix de consolidacion (`consolidate_merge.py`, Silver).** El streaming a veces deja la
-misma persona partida en 2 filas de `persons` (mismo `passport`, fragmentos
-complementarios con distinto `match_key`). Este job las fusiona en Postgres:
+**Contexto (por que el nombre es el problema).** Los datos vienen en dos "islas" que no
+comparten identificador: (A) Personal+Bank unidas por `passport`; (B)
+Location+Professional+Net unidas por `fullname`/`address`. Entre A y B solo esta el
+NOMBRE, y difiere: Personal lo trae corto (`name`+`last_name`, 2 palabras), Location/
+Professional lo traen completo (`fullname`, con apellido extra). Medido en los datos
+reales: una "Maite Rodriguez Sanchez" (isla B, sin passport) puede corresponder a varias
+"Maite Rodriguez" (isla A, con passports distintos) → la union Personal↔Location es
+**intrinsecamente ambigua** (~68% de los nombres cortos mapean a >1 candidato). Por eso el
+sistema **consolida solo lo inequivoco** y **propone el resto a revision humana**.
 
-- Solo fusiona **mismo `passport` Y `norm_name` muy parecido** (`similarity >= 0.85`).
-  Passport igual + nombres claramente distintos = colision del generador → NO se fusiona.
-- **Survivorship**: superviviente = `min(id)`; primer valor no nulo por campo (nunca pisa
-  un dato bueno con NULL); `full_name` = el mas largo; `created_at` = el mas antiguo;
-  `updated_at` = el mas reciente; `norm_name` se recalcula del `full_name` ganador.
-- Todo set-based en una transaccion; a Python solo vuelven conteos (RAM plana). Idempotente.
+**1. Fix de consolidacion (`consolidate_merge.py`, Silver).** Fusiona en Postgres la misma
+persona partida en varias filas, por dos vias:
 
-**2. Reconciliacion (`reconcile.py`).** Igual que antes (dos reglas typo/contencion,
-blocking `keyt`/`key2`, ancla `min(id)`, `INSERT...SELECT`, sin caps), pero la Fase 1 ahora
-**lee `norm_name` ya materializado** en lugar de recomputar el regex sobre 2.2M filas — el
-cambio clave para que escale (~2-4 min estimado en la VM). Un guard idempotente rellena
-`norm_name` de filas que no lo tengan antes de detectar. `reason` sigue siendo solo
-etiquetas fijas (sin PII).
+- **VIA 1 — mismo `passport` Y `norm_name` muy parecido** (`similarity >= 0.85`). Passport
+  igual + nombres claramente distintos = colision del generador → NO se fusiona.
+- **VIA 2 — `norm_name` IDENTICO en un bucket de tamaño 2**, con perfil complementario (un
+  lado Personal con passport, otro Location con address) y **sin contradiccion de
+  passport**. Son personas partidas que el streaming no unio (mismo nombre exacto, fuentes
+  distintas). Medido en la VM: fusiono **202.769** filas (persons 2.21M → 1.95M). Buckets
+  de 3+ o con passports distintos NO se tocan (riesgo de mezclar personas distintas).
+- **Survivorship**: superviviente = `min(id)` (cierre transitivo por si hay cadenas);
+  primer valor no nulo por campo (nunca pisa un dato bueno con NULL); `full_name` = el mas
+  largo; `created_at` = el mas antiguo; `updated_at` = el mas reciente; `norm_name`
+  recalculado del `full_name` ganador. Todo set-based, en una transaccion, idempotente.
 
-**3. Gold de personas (`gold_layer.py`).** Se añade la tabla `gold_persons` = subconjunto
-"completo" de Silver: **≥80% de los 8 campos de datos rellenos Y los 5 obligatorios**
-presentes (`full_name`, `passport`, `email`, `city`, `company`). Las stats `gold_*`
-(`gold_stats`, `gold_top_cities`, `gold_top_companies`, `gold_completeness`) ahora se
-calculan **sobre `gold_persons`** (calidad), no sobre todo Silver (volumen). Rebuild
-completo idempotente.
+**2. Reconciliacion (`reconcile.py`, solo SUGIERE).** Busca en **Silver** candidatos a
+duplicado para **revision humana** (nunca auto-merge). El criterio es **SOLO el nombre**,
+**sin exigir ningun campo compartido**:
+
+- **Match por nombre**: identico repetido, typo (`0.85 <= sim < 1.0`, trigrama GIN) o
+  contencion (apellido extra, "octavio ponce" ⊆ "octavio ponce gimenez").
+- **Sin corroboracion por campo, a proposito**: las personas partidas reales tienen datos
+  DISJUNTOS entre islas (no comparten email/phone/company), asi que exigir un campo
+  compartido descartaria justo a los duplicados verdaderos. Y si dos comparten nombre Y un
+  campo fuerte, es que son la misma → eso lo arregla la consolidacion, no la revision.
+- **Unica guarda negativa**: no-contradiccion de `passport` (passports distintos = personas
+  distintas; separa los homonimos tipo "jose luis"). Nombres de 1 palabra excluidos.
+- Deteccion 100% SQL sobre un catalogo de nombres DISTINTOS (escala), ancla `min(id)`,
+  `INSERT...SELECT`, sin caps, `statement_timeout` como salvavidas. `reason` = etiquetas
+  fijas sin PII (`exact_name` / `fuzzy_name` / `name_containment`).
+- Es deliberadamente permisiva: nombres comunes generan grupos de revision (p. ej. varios
+  "juan perez"). Es aceptable porque solo propone y porque Gold ya excluye los ambiguos.
+
+**3. Gold de personas (`gold_layer.py`) — sin duplicados por construccion.** `gold_persons`
+= subconjunto "completo" de Silver: **≥80% de los 8 campos Y los 5 obligatorios**
+(`full_name`, `passport`, `email`, `city`, `company`), **Y** cuyo nombre **NO este marcado
+en `duplicate_groups`** (no es identico/typo/contenido con otro en Silver). Esa segunda
+condicion es la clave: una persona con nombre ambiguo NO llega a Gold, porque no hay certeza
+de que sus 5 campos sean de una sola persona real. Asi Gold queda **libre de duplicados por
+construccion**. Exige el orden `reconcile >> refresh_gold` (garantizado por el DAG). Las
+stats `gold_*` se calculan sobre `gold_persons`. Rebuild completo idempotente.
 
 Ejecucion (o via el DAG `hr_etl_maintenance`):
 ```
@@ -415,6 +448,22 @@ Metricas Prometheus añadidas (solo numericas, sin PII): `hr_etl_consolidation_m
 
 #### Ideas RECHAZADAS y por que (DEC-9)
 
+- **Exigir corroboracion por campo en la reconciliacion** → las personas partidas reales
+  tienen datos DISJUNTOS entre islas (Personal con passport/email vs Location con
+  address/company), asi que exigir un campo compartido descarta justo a los duplicados
+  verdaderos. Y un par que comparte nombre + campo fuerte no es "posible duplicado": es la
+  misma persona que debio consolidarse. Por eso reconcile agrupa SOLO por nombre.
+- **Agrupar por nombre identico solo (regla laxa B1)** → con 2.2M filas, el nombre identico
+  es coincidencia frecuentisima, no evidencia: dio 506k grupos de ruido. Ahora los identicos
+  seguros los fusiona la consolidacion (VIA 2, bucket de 2 + fuentes complementarias) y el
+  resto se propone a revision, nunca se auto-mergea.
+- **Unir Personal↔Location por prefijo de 2 palabras** → el fullname completo (que
+  desambiguaria) vive solo en el lado sin passport; el 68% de los prefijos mapean a varios
+  candidatos con passport distinto (una "Maite Rodriguez Sanchez" vs cinco "Maite
+  Rodriguez"). Imposible elegir sin inventar; no se auto-mergea por prefijo.
+- **Dos columnas de nombre (`full_name` Personal + `professional_name` Location)** → ordena
+  mejor el almacenamiento pero NO crea puente de union: la mitad Personal no tiene el
+  fullname completo, asi que las dos mitades siguen sin un valor comun. No resuelve el caso.
 - **passport/email como eje de la pestaña Duplicados** → passport repetido es un fix de
   consolidacion (misma persona partida), no un "posible duplicado"; email repetido es RUIDO
   del generador (p. ej. `cgonzalez@yahoo.com` en 45 personas distintas). Ni email ni phone

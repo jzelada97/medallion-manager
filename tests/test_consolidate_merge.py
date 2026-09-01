@@ -231,3 +231,110 @@ def test_consolidation_empty_warehouse(pg_session_factory):
         assert run_consolidation(session) == 0
     finally:
         session.close()
+
+
+# ======================================================================
+# VÍA 2 — split person by IDENTICAL name (the ~203k real case from the VM):
+# a Location-side row (address, no passport) and a Personal-side row (passport,
+# no address) with the SAME normalized name were never joined in streaming.
+# They are the same person and must merge, tightly gated to stay safe.
+# ======================================================================
+
+
+def test_via2_merges_split_person_identical_name(pg_session_factory):
+    """Location-side (address, NO passport) + Personal-side (passport, NO address) with
+    the same normalized name: the streaming split them, VÍA 2 merges them even though
+    they share NO field but the name (disjoint data)."""
+    session = pg_session_factory()
+    try:
+        loc = _add_person(
+            session, "name:aaron allan", "Aaron Allan", city="Posadas", address="Rua 71"
+        )
+        per = _add_person(
+            session, "passport:X22", "aaron allan", passport="X22169584", email="a@x.com"
+        )
+        session.commit()
+        expected_survivor = min(loc.id, per.id)
+
+        merged = run_consolidation(session)
+
+        assert merged == 1
+        rows = _persons(session)
+        assert len(rows) == 1
+        survivor = rows[0]
+        assert survivor.id == expected_survivor
+        # complementary disjoint data folded together
+        assert survivor.passport == "X22169584"
+        assert survivor.address == "Rua 71"
+        assert survivor.city == "Posadas"
+        assert survivor.email == "a@x.com"
+    finally:
+        session.close()
+
+
+def test_via2_does_not_merge_identical_name_different_passports(pg_session_factory):
+    """Two people with the same name who BOTH carry a DIFFERENT passport are provably
+    distinct homonyms (the ~44k freq=2 case): VÍA 2 must NOT merge them."""
+    session = pg_session_factory()
+    try:
+        _add_person(session, "k:h-1", "juan ignacio", passport="AAA111", city="Madrid")
+        _add_person(session, "k:h-2", "juan ignacio", passport="BBB222", city="Sevilla")
+        session.commit()
+
+        merged = run_consolidation(session)
+
+        assert merged == 0
+        assert len(_persons(session)) == 2
+    finally:
+        session.close()
+
+
+def test_via2_does_not_merge_identical_name_both_without_passport(pg_session_factory):
+    """Same name, NEITHER side has a passport: too ambiguous to auto-merge (could be two
+    different people). VÍA 2 requires at least one passport, so these stay separate."""
+    session = pg_session_factory()
+    try:
+        _add_person(session, "k:np-1", "maria lopez", city="Madrid", address="A St")
+        _add_person(session, "k:np-2", "maria lopez", city="Sevilla", address="B St")
+        session.commit()
+
+        merged = run_consolidation(session)
+
+        assert merged == 0
+        assert len(_persons(session)) == 2
+    finally:
+        session.close()
+
+
+def test_via2_does_not_merge_bucket_larger_than_two(pg_session_factory):
+    """Conservative gate: a same-name bucket with MORE than 2 eligible rows is left alone
+    for now (may hold real homonyms); only clean freq=2 buckets auto-merge."""
+    session = pg_session_factory()
+    try:
+        _add_person(session, "name:leo diaz", "Leo Diaz", address="Calle 1")  # no passport
+        _add_person(session, "passport:D1", "leo diaz", passport="D111", email="l1@x.com")
+        _add_person(session, "passport:D2", "leo diaz", passport="D222", email="l2@x.com")
+        session.commit()
+
+        merged = run_consolidation(session)
+
+        assert merged == 0
+        assert len(_persons(session)) == 3
+    finally:
+        session.close()
+
+
+def test_via2_single_word_name_not_merged(pg_session_factory):
+    """A single-word normalized name is too ambiguous and is excluded (>= 2 words)."""
+    session = pg_session_factory()
+    try:
+        _add_person(session, "name:madonna", "Madonna", address="Studio")  # no passport
+        _add_person(session, "passport:M1", "madonna", passport="M111", email="m@x.com")
+        session.commit()
+
+        merged = run_consolidation(session)
+
+        assert merged == 0
+        assert len(_persons(session)) == 2
+    finally:
+        session.close()
