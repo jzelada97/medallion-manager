@@ -91,9 +91,11 @@ def _groups(session) -> dict[int, list[DuplicateGroup]]:
 def test_fuzzy_groups_typo_surname(pg_session_factory):
     session = pg_session_factory()
     try:
-        # One-letter difference at the end: exact matching would miss this.
-        a = _add_person(session, "passport:X1", "jean leclerc")
-        b = _add_person(session, "name:jean leclercq", "jean leclercq")
+        # One-letter difference at the end: exact matching would miss this. They share a
+        # strong signal (email) so the typo rule links them (a real typo of the same
+        # person corroborates; name similarity alone is not enough).
+        a = _add_person(session, "passport:X1", "jean leclerc", email="jl@x.com")
+        b = _add_person(session, "name:jean leclercq", "jean leclercq", email="jl@x.com")
         session.commit()
 
         n = run_reconciliation(session, similarity_threshold=0.6)
@@ -174,8 +176,8 @@ def test_accents_normalized_together(pg_session_factory):
 def test_group_anchored_to_min_id(pg_session_factory):
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:X1", "maria lopez")
-        b = _add_person(session, "name:maria lopezz", "maria lopezz")
+        a = _add_person(session, "passport:X1", "maria lopez", email="mlz@x.com")
+        b = _add_person(session, "name:maria lopezz", "maria lopezz", email="mlz@x.com")
         session.commit()
 
         run_reconciliation(session, similarity_threshold=0.6)
@@ -193,8 +195,8 @@ def test_fuzzy_pair_gets_fuzzy_reason(pg_session_factory):
     """Near-identical surnames (typo) are grouped with the fuzzy_name reason label."""
     session = pg_session_factory()
     try:
-        _add_person(session, "passport:X1", "ana gil", city="Madrid")
-        _add_person(session, "name:ana gill", "ana gill", city="Madrid")
+        _add_person(session, "passport:X1", "ana gil", phone="600999888")
+        _add_person(session, "name:ana gill", "ana gill", phone="600999888")
         session.commit()
 
         run_reconciliation(session, similarity_threshold=0.6)
@@ -299,9 +301,10 @@ def test_backfill_populates_norm_name_before_detection(pg_session_factory):
     reconciliation guard, so detection still works over norm_name."""
     session = pg_session_factory()
     try:
-        # Insert with full_name only; norm_name left NULL on purpose.
-        a = _add_person(session, "k:bf-1", "maria lopez")
-        b = _add_person(session, "k:bf-2", "maria lopezz")
+        # Insert with full_name only; norm_name left NULL on purpose. Shared email so the
+        # typo rule (which now requires corroboration) can link them.
+        a = _add_person(session, "k:bf-1", "maria lopez", email="bfm@x.com")
+        b = _add_person(session, "k:bf-2", "maria lopezz", email="bfm@x.com")
         session.commit()
 
         run_reconciliation(session, similarity_threshold=0.6)
@@ -340,8 +343,8 @@ _ALLOWED_REASONS = {
 def test_t4_typo_maria_martin_groups(pg_session_factory):
     session = pg_session_factory()
     try:
-        a = _add_person(session, "passport:T4a", "maria martin")
-        b = _add_person(session, "name:maria martins", "maria martins")
+        a = _add_person(session, "passport:T4a", "maria martin", email="mm@x.com")
+        b = _add_person(session, "name:maria martins", "maria martins", email="mm@x.com")
         session.commit()
 
         n = run_reconciliation(session, similarity_threshold=0.6)
@@ -516,11 +519,11 @@ def test_t10_idempotent_two_runs_same_groups(pg_session_factory):
 def test_sec_t1_reason_has_no_pii_only_fixed_labels(pg_session_factory):
     session = pg_session_factory()
     try:
-        # A mix that exercises several reason branches.
-        _add_person(session, "passport:S1a", "jean leclerc", city="Paris")
-        _add_person(session, "name:jean leclercq", "jean leclercq", city="Paris")
-        _add_person(session, "passport:S1c", "octavio ponce", city="Madrid")
-        _add_person(session, "name:opg", "octavio ponce gimenez", city="Madrid")
+        # A mix that exercises several reason branches (each pair shares a strong signal).
+        _add_person(session, "passport:S1a", "jean leclerc", email="jl2@x.com")
+        _add_person(session, "name:jean leclercq", "jean leclercq", email="jl2@x.com")
+        _add_person(session, "passport:S1c", "octavio ponce", email="op2@x.com")
+        _add_person(session, "name:opg", "octavio ponce gimenez", email="op2@x.com")
         session.commit()
 
         run_reconciliation(session, similarity_threshold=0.6)

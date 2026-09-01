@@ -327,7 +327,12 @@ _BUILD_NAME_PERSON_PAIRS_SQL = text(
         JOIN _recon_pn pb ON pb.norm = np.b
         WHERE pa.id <> pb.id
           AND {_PASSPORT_OK}
-          AND (NOT np.contain OR {_CORROBORATES});
+          -- BOTH fuzzy and containment REQUIRE corroboration. Name similarity alone is
+          -- not evidence: 742 different "jose luis" (a common compound name) share the
+          -- name and even keyt, but they are different people. A real typo of the SAME
+          -- person almost always shares a strong signal (email/phone/address). Without
+          -- corroboration we do not group — this is what stops the fuzzy homonym pile-up.
+          AND {_CORROBORATES};
     """
 )
 
