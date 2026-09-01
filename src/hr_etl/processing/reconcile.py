@@ -91,6 +91,14 @@ _STATEMENT_TIMEOUT_MS = 600_000  # 10 minutes
 # high-frequency first names from forming spurious groups.
 _MIN_NAME_TOKENS = 2
 
+# A corroborating signal shared by more than this many people (within the same name) is
+# NOT discriminating — it's noise, not evidence of same-person. The weak city+company
+# signal can hit this in low-variety data (few cities/companies); pruning these keeps the
+# join from exploding and, more importantly, avoids grouping unrelated people who merely
+# happen to share a common city+company. Strong signals (email/phone/address) rarely hit
+# it, but the same guard protects against collided values (e.g. a shared generator email).
+_MAX_SIGNAL_FREQ = 50
+
 # Canonical SQL norm expression (lowercase, translate accents, collapse whitespace, strip
 # titles both ends). Single source of truth in processing/sql_norm; identical to the
 # Python compute_norm_name and the migration backfill so streaming and batch agree.
@@ -177,29 +185,11 @@ _INDEX_NAMES_SQL = text(
     " ANALYZE _recon_pn;"
 )
 
-# ---------------------------------------------------------------------------
-# Phase 2 — link distinct names via TWO rules, each with its OWN efficient blocking,
-# then group by canonical anchor and propagate to persons.
-#
-#   RULE 1 — TYPO (trigram similarity >= :threshold). Blocking = keyt (given name + first
-#   3 chars of the first surname), an equality join. This splits huge given-name blocks
-#   into tiny sub-blocks so `similarity()` only runs on a handful of candidates — the key
-#   speedup on 2M+ rows. Catches "jean leclerc" vs "jean leclercq".
-#
-#   RULE 2 — CONTAINMENT (every word of one name is in the other). Blocking = key2 (first
-#   two words), then the `<@` array test. Catches "octavio ponce" ⊆ "octavio ponce
-#   gimenez" WITHOUT lowering the similarity threshold (trigram similarity would miss it).
-#
-# The two candidate-pair sets are UNIONed, self is added (so every name anchors), then a
-# single grouping assigns group_id = smallest anchor_id among linked names. No caps.
-# ---------------------------------------------------------------------------
 # Corroboration that two same/similar-named persons are plausibly the SAME person.
 # STRONG signals are near-unique, so ONE is enough: email, phone, exact address.
 # WEAK signals are low-cardinality (many unrelated people share them), so a single one is
 # NOT enough — two people named "Maria Garcia" both in Madrid are probably different. A
-# weak signal only counts when TWO of them agree together (same city AND same company).
-#   strong  = email | phone | address
-#   weak    = (city AND company)
+# weak signal only counts when the TWO of them agree together (same city AND same company).
 _CORROBORATES = """(
         (pa.email   IS NOT NULL AND pa.email   = pb.email)
      OR (pa.phone   IS NOT NULL AND pa.phone   = pb.phone)
@@ -211,99 +201,157 @@ _PASSPORT_OK = (
     "NOT (pa.passport IS NOT NULL AND pb.passport IS NOT NULL AND pa.passport <> pb.passport)"
 )
 
-# The reconciliation surfaces PLAUSIBLE same-person pairs (never certain). Three rules,
-# all resolved to PERSON pairs so passport/corroboration can be judged per person:
-#
-#   exact_name  : same normalized name, but only for AMBIGUOUS cases — at least one side
-#                 has NO passport (a person with a passport and complete data is not a
-#                 "maybe" of a same-named other). The pair must share a corroborating
-#                 attribute (email/phone/city/address/company). Homonyms with different
-#                 passports and no shared data (the 1982 "juan ignacio") are NOT grouped.
-#   fuzzy_name  : near-identical names (trigram >= threshold), passports must not contradict.
-#   containment : one name contained in the other, corroborated, passports must not contradict.
-#
-# Name blocking (keyt/key2) still runs over the DISTINCT-name catalog to stay cheap; the
-# resulting name pairs are then expanded to person pairs with the passport/corroboration
-# guards. group_id = min person id among linked persons (anchor). No result caps.
-_DETECT_SQL = text(
+# ---------------------------------------------------------------------------
+# The candidate universe is driven by PERSONS WITHOUT A PASSPORT. A person with a passport
+# already has a strong identity: it is only ever pulled into a group by an AMBIGUOUS
+# (passport-less) same-person candidate, never on its own. Starting from the ~294k
+# passport-less rows (not all 2.2M) is the key scale lever. Each stage below is
+# MATERIALIZED into an indexed temp table (not one giant CTE) so Postgres on 2 vCPU can
+# plan each join over small, analyzed inputs instead of choking on a monolithic query.
+# ---------------------------------------------------------------------------
+
+# Step A — passport-less eligible persons + their corroborating signals (one row per
+# (person, signal)). Signals: strong email/phone/address, or the weak city+company pair.
+_BUILD_AMB_SIG_SQL = text(
+    """
+    DROP TABLE IF EXISTS _amb_sig;
+    CREATE TEMP TABLE _amb_sig AS
+        SELECT id, norm, 'e:'  || email                 AS sig FROM _recon_pn WHERE passport IS NULL AND email   IS NOT NULL
+        UNION ALL
+        SELECT id, norm, 'p:'  || phone                 AS sig FROM _recon_pn WHERE passport IS NULL AND phone   IS NOT NULL
+        UNION ALL
+        SELECT id, norm, 'a:'  || address               AS sig FROM _recon_pn WHERE passport IS NULL AND address IS NOT NULL
+        UNION ALL
+        SELECT id, norm, 'cc:' || city || '|' || company AS sig FROM _recon_pn
+            WHERE passport IS NULL AND city IS NOT NULL AND company IS NOT NULL;
+    CREATE INDEX _amb_sig_ns ON _amb_sig (norm, sig);
+    ANALYZE _amb_sig;
+    """
+)
+
+# The same signal expression for ANY person (used to find the partner rows to pull in).
+# High-frequency (norm, sig) buckets are PRUNED: a signal shared by many people within a
+# name is not discriminating (a common city+company, or a collided email), and would both
+# explode the join and group unrelated people. Pruning here (the partner side) is enough —
+# a signal only matches if it survives in _all_sig.
+_ALL_SIG_SQL = text(
     f"""
-    WITH exact_sig AS (
-        -- one row per (person, corroborating signal it actually has). The signal VALUE is
-        -- the blocking key together with norm; people sharing (norm, signal) are the same
-        -- person candidate. This replaces the O(n^2) per-name self-join with set ops.
-        SELECT id, norm, passport, 'e:' || email AS sig FROM _recon_pn WHERE email IS NOT NULL
+    DROP TABLE IF EXISTS _all_sig;
+    CREATE TEMP TABLE _all_sig AS
+        SELECT id, norm, passport, 'e:'  || email   AS sig FROM _recon_pn WHERE email   IS NOT NULL
         UNION ALL
-        SELECT id, norm, passport, 'p:' || phone AS sig FROM _recon_pn WHERE phone IS NOT NULL
+        SELECT id, norm, passport, 'p:'  || phone   AS sig FROM _recon_pn WHERE phone   IS NOT NULL
         UNION ALL
-        SELECT id, norm, passport, 'a:' || address AS sig FROM _recon_pn WHERE address IS NOT NULL
+        SELECT id, norm, passport, 'a:'  || address AS sig FROM _recon_pn WHERE address IS NOT NULL
         UNION ALL
-        SELECT id, norm, passport, 'cc:' || city || '|' || company AS sig
-        FROM _recon_pn WHERE city IS NOT NULL AND company IS NOT NULL
-    ),
-    exact_blocks AS (
-        -- valid blocks: >=2 people share (norm, signal), at least one WITHOUT passport
-        -- (ambiguous), and no two distinct non-null passports (no contradiction).
-        SELECT norm, sig, min(id) AS anchor
-        FROM exact_sig
-        GROUP BY norm, sig
-        HAVING count(*) > 1
-           AND count(*) FILTER (WHERE passport IS NULL) > 0
-           AND count(DISTINCT passport) <= 1
-    ),
-    exact_pairs AS (
-        -- membership edges: each person in a valid block -> its block anchor.
-        SELECT es.id AS pid, eb.anchor AS other, 1.0::float AS sim, 'exact' AS kind
-        FROM exact_sig es
-        JOIN exact_blocks eb ON eb.norm = es.norm AND eb.sig = es.sig
-        WHERE es.id <> eb.anchor
-    ),
-    name_pairs AS (
-        -- typo (rule 1) and containment (rule 2) as DISTINCT-name pairs (cheap blocking).
-        SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, FALSE AS contain
-        FROM _recon_names n
-        JOIN _recon_names m
-          ON n.keyt = m.keyt AND n.norm <> m.norm
-         AND similarity(n.norm, m.norm) >= :threshold
+        SELECT id, norm, passport, 'cc:' || city || '|' || company AS sig FROM _recon_pn
+            WHERE city IS NOT NULL AND company IS NOT NULL;
+    -- prune non-discriminating high-frequency signals
+    DELETE FROM _all_sig s USING (
+        SELECT norm, sig FROM _all_sig GROUP BY norm, sig HAVING count(*) > {_MAX_SIGNAL_FREQ}
+    ) big
+    WHERE s.norm = big.norm AND s.sig = big.sig;
+    CREATE INDEX _all_sig_ns ON _all_sig (norm, sig);
+    ANALYZE _all_sig;
+    """
+)
+
+# Step B — EXACT pairs: an ambiguous person joins any other person that shares its
+# (norm, signal). Driven by the small _amb_sig, probed against _all_sig by the (norm,sig)
+# index. No cartesian product: each ambiguous signal row fetches only its exact key match.
+_BUILD_EXACT_PAIRS_SQL = text(
+    """
+    DROP TABLE IF EXISTS _exact_pairs;
+    CREATE TEMP TABLE _exact_pairs AS
+        SELECT DISTINCT a.id AS pid, o.id AS other
+        FROM _amb_sig a
+        JOIN _all_sig o ON o.norm = a.norm AND o.sig = a.sig AND o.id <> a.id;
+    """
+)
+
+# Step C — NAME pairs (typo + containment) START from the passport-less rows too. We build
+# a small catalog of the ambiguous names and only compare those against the full name
+# catalog by the blocking key (keyt/key2). This bounds the trigram/containment work to the
+# ambiguous side instead of the whole 2.2M.
+_BUILD_AMB_NAMES_SQL = text(
+    f"""
+    DROP TABLE IF EXISTS _amb_names;
+    CREATE TEMP TABLE _amb_names AS
+        SELECT DISTINCT p.norm,
+               regexp_split_to_array(p.norm, ' ')                       AS words,
+               (regexp_split_to_array(p.norm,' '))[1] || '|' ||
+                   left((regexp_split_to_array(p.norm,' '))[2], 3)       AS keyt,
+               (regexp_split_to_array(p.norm,' '))[1] || ' ' ||
+                   (regexp_split_to_array(p.norm,' '))[2]                AS key2
+        FROM _recon_pn p
+        WHERE p.passport IS NULL
+          AND array_length(regexp_split_to_array(p.norm, ' '), 1) >= {_MIN_NAME_TOKENS};
+    CREATE INDEX _amb_names_keyt ON _amb_names (keyt);
+    CREATE INDEX _amb_names_key2 ON _amb_names (key2);
+    ANALYZE _amb_names;
+    """
+)
+
+# typo/containment name-pairs: ambiguous names vs the full distinct-name catalog.
+_BUILD_NAME_PAIRS_SQL = text(
+    """
+    DROP TABLE IF EXISTS _name_pairs;
+    CREATE TEMP TABLE _name_pairs AS
+        SELECT a.norm AS a, m.norm AS b, similarity(a.norm, m.norm) AS sim, FALSE AS contain
+        FROM _amb_names a
+        JOIN _recon_names m ON m.keyt = a.keyt AND m.norm <> a.norm
+        WHERE similarity(a.norm, m.norm) >= :threshold
         UNION ALL
-        SELECT n.norm AS a, m.norm AS b, similarity(n.norm, m.norm) AS sim, TRUE AS contain
-        FROM _recon_names n
-        JOIN _recon_names m
-          ON n.key2 = m.key2 AND n.norm <> m.norm
-         AND array_length(n.words, 1) <> array_length(m.words, 1)
-         AND (n.words <@ m.words OR m.words <@ n.words)
-    ),
-    name_person_pairs AS (
-        -- expand name pairs to person pairs, applying the passport non-contradiction and
-        -- (for containment) corroboration guards at the person level.
+        SELECT a.norm AS a, m.norm AS b, similarity(a.norm, m.norm) AS sim, TRUE AS contain
+        FROM _amb_names a
+        JOIN _recon_names m ON m.key2 = a.key2 AND m.norm <> a.norm
+        WHERE array_length(a.words, 1) <> array_length(m.words, 1)
+          AND (a.words <@ m.words OR m.words <@ a.words);
+    CREATE INDEX _name_pairs_a ON _name_pairs (a);
+    CREATE INDEX _name_pairs_b ON _name_pairs (b);
+    ANALYZE _name_pairs;
+    """
+)
+
+# Step D — expand name-pairs to PERSON pairs. The ambiguous side (person of name `a`) must
+# be passport-less; the partner (name `b`) can be anyone. Apply passport non-contradiction
+# and (for containment) corroboration at the person level.
+_BUILD_NAME_PERSON_PAIRS_SQL = text(
+    f"""
+    DROP TABLE IF EXISTS _name_person_pairs;
+    CREATE TEMP TABLE _name_person_pairs AS
         SELECT pa.id AS pid, pb.id AS other, np.sim,
                CASE WHEN np.contain THEN 'contain' ELSE 'fuzzy' END AS kind
-        FROM name_pairs np
-        JOIN _recon_pn pa ON pa.norm = np.a
+        FROM _name_pairs np
+        JOIN _recon_pn pa ON pa.norm = np.a AND pa.passport IS NULL
         JOIN _recon_pn pb ON pb.norm = np.b
         WHERE pa.id <> pb.id
           AND {_PASSPORT_OK}
-          AND (NOT np.contain OR {_CORROBORATES})   -- containment needs corroboration
-    ),
-    directed AS (
-        SELECT pid, other, sim, kind FROM exact_pairs
+          AND (NOT np.contain OR {_CORROBORATES});
+    """
+)
+
+# Step E — union all person pairs, make them bidirectional (so anchors are included),
+# anchor each person to the smallest linked id, and INSERT memberships. Reason from the
+# strongest rule present. No PII in reason (fixed labels). No result caps.
+_DETECT_INSERT_SQL = text(
+    """
+    WITH directed AS (
+        SELECT pid, other, 1.0::float AS sim, 'exact' AS kind FROM _exact_pairs
         UNION ALL
-        SELECT pid, other, sim, kind FROM name_person_pairs
+        SELECT pid, other, sim, kind FROM _name_person_pairs
     ),
     all_pairs AS (
-        -- make edges bidirectional so BOTH members (including the anchor) become a `pid`
-        -- and land in a group; otherwise the anchor row would be missing from its group.
         SELECT pid, other, sim, kind FROM directed
         UNION ALL
         SELECT other AS pid, pid AS other, sim, kind FROM directed
     ),
     person_groups AS (
-        -- anchor each linked person to the smallest person id it links to.
         SELECT pid,
                LEAST(pid, min(other)) AS group_id,
                max(sim) AS confidence,
                bool_or(kind = 'contain') AS has_containment,
-               bool_or(kind = 'fuzzy') AS has_fuzzy,
-               bool_or(kind = 'exact') AS has_exact
+               bool_or(kind = 'fuzzy')   AS has_fuzzy
         FROM all_pairs
         GROUP BY pid
     )
@@ -322,6 +370,7 @@ _DETECT_SQL = text(
 )
 
 
+# ---------------------------------------------------------------------------
 def _ensure_pg_trgm(session: Session) -> bool:
     """Enable the pg_trgm extension (idempotent). Returns False if it can't be enabled.
 
@@ -362,14 +411,21 @@ def run_reconciliation(
         session.execute(delete(DuplicateGroup))
         # Phase 0: ensure norm_name is materialized (guarded no-op once populated).
         session.execute(_BACKFILL_NORM_SQL)
-        # Phase 1: distinct-name catalog + blocking keys, reading materialized norm_name.
+        # Phase 1: eligible persons + distinct-name catalog (materialized, indexed).
         session.execute(_BUILD_PN_SQL)
         session.execute(_BUILD_NAMES_SQL)
         session.execute(_INDEX_NAMES_SQL)
-        # Phase 2: link names (typo + containment), group, and INSERT memberships straight
-        # into duplicate_groups — the rows never travel to Python (no ORM materialization
-        # of hundreds of thousands of objects), which keeps it fast and memory-flat.
-        result = session.execute(_DETECT_SQL, {"threshold": threshold})
+        # Phase 2: candidate detection driven by the passport-less (ambiguous) rows.
+        # Each step is a small, indexed, ANALYZE'd temp table so the planner never faces a
+        # monolithic CTE (which timed out on the 2 vCPU VM). The heavy work stays in SQL;
+        # only a row count returns to Python (RAM-flat).
+        session.execute(_BUILD_AMB_SIG_SQL)
+        session.execute(_ALL_SIG_SQL)
+        session.execute(_BUILD_EXACT_PAIRS_SQL)
+        session.execute(_BUILD_AMB_NAMES_SQL)
+        session.execute(_BUILD_NAME_PAIRS_SQL, {"threshold": threshold})
+        session.execute(_BUILD_NAME_PERSON_PAIRS_SQL)
+        result = session.execute(_DETECT_INSERT_SQL)
         written = result.rowcount
         session.commit()
     except SQLAlchemyError as exc:
