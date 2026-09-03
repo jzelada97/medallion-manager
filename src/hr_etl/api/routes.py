@@ -5,9 +5,16 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
 
-from hr_etl.models.db_models import DuplicateGroup, MatchCandidate, PersonRow
+from hr_etl.models.db_models import DuplicateGroup, GoldPerson, MatchCandidate, PersonRow
+
+
+class ConsolidateRequest(BaseModel):
+    """Payload for POST /consolidate: person ids a human chose to merge."""
+
+    person_ids: list[int] = Field(..., min_length=2, description="Ids to merge (>= 2)")
 
 
 def _row_to_dict(row: PersonRow) -> dict:
@@ -30,6 +37,30 @@ def _row_to_dict(row: PersonRow) -> dict:
         "iban": row.iban,
         "salary": row.salary,
         "ipv4": row.ipv4,
+    }
+
+
+def _gold_row_to_dict(row: GoldPerson) -> dict:
+    return {
+        "id": row.id,
+        "passport": row.passport,
+        "full_name": row.full_name,
+        "name": row.name,
+        "lastname": row.lastname,
+        "sex": row.sex,
+        "phone": row.phone,
+        "email": row.email,
+        "city": row.city,
+        "address": row.address,
+        "company": row.company,
+        "company_address": row.company_address,
+        "company_phone": row.company_phone,
+        "company_email": row.company_email,
+        "job": row.job,
+        "iban": row.iban,
+        "salary": row.salary,
+        "ipv4": row.ipv4,
+        "completeness": row.completeness,
     }
 
 
@@ -242,6 +273,88 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
                 "count": len(limited),
                 "groups": limited,
             }
+        finally:
+            session.close()
+
+    @router.get("/gold/persons")
+    def list_gold_persons(
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        q: str | None = Query(None, description="Free-text search on name/company/email"),
+        city: str | None = None,
+        company: str | None = None,
+        job: str | None = None,
+    ) -> dict:
+        """List Gold-layer persons with filters, free-text search and pagination.
+
+        Same filter contract as ``/persons`` but scoped to ``gold_persons`` — the
+        curated, completeness-qualified, name-unique subset of Silver (see
+        ``warehouse/gold_layer.py``). Returns an empty page (not an error) if Gold has
+        not been refreshed yet or the table doesn't exist on this backend.
+        """
+        session = session_factory()
+        try:
+            filters = []
+            if city:
+                filters.append(func.lower(GoldPerson.city) == city.strip().lower())
+            if company:
+                filters.append(GoldPerson.company.ilike(f"%{company.strip()}%"))
+            if job:
+                filters.append(GoldPerson.job.ilike(f"%{job.strip()}%"))
+            if q:
+                like = f"%{q.strip()}%"
+                filters.append(
+                    or_(
+                        GoldPerson.full_name.ilike(like),
+                        GoldPerson.name.ilike(like),
+                        GoldPerson.lastname.ilike(like),
+                        GoldPerson.company.ilike(like),
+                        GoldPerson.email.ilike(like),
+                    )
+                )
+
+            base = select(GoldPerson)
+            count_stmt = select(func.count()).select_from(GoldPerson)
+            for f in filters:
+                base = base.where(f)
+                count_stmt = count_stmt.where(f)
+
+            total = session.execute(count_stmt).scalar_one()
+            rows = (
+                session.execute(base.order_by(GoldPerson.id).limit(limit).offset(offset))
+                .scalars()
+                .all()
+            )
+
+            return {
+                "total": total,
+                "count": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "items": [_gold_row_to_dict(r) for r in rows],
+            }
+        finally:
+            session.close()
+
+    @router.post("/consolidate")
+    def consolidate_persons(payload: ConsolidateRequest) -> dict:
+        """Merge a HUMAN-SELECTED set of person rows (from the Duplicados review pane).
+
+        Unlike the automatic batch jobs (consolidate_merge VÍA 1/2), this applies no
+        name-similarity or passport-non-contradiction gate: the caller's selection IS the
+        authorization to merge. Intended for ambiguous cases the automatic rules refuse
+        to guess (e.g. several same-name candidates where only a human can tell which
+        one is the real match). Runs in one transaction; 400 on invalid/missing ids.
+        """
+        from hr_etl.processing.consolidate_merge import run_manual_consolidation
+
+        session = session_factory()
+        try:
+            try:
+                merged = run_manual_consolidation(session, payload.person_ids)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return {"merged": merged, "person_ids": sorted(set(payload.person_ids))}
         finally:
             session.close()
 

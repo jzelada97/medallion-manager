@@ -35,6 +35,24 @@ def api_get(path: str, params: dict | None = None) -> dict | None:
         return None
 
 
+def api_post(path: str, json: dict | None = None) -> dict | None:
+    """POST a JSON payload to the API. On a 4xx, shows the backend's error detail
+    (e.g. "person id(s) not found: [...]") instead of a generic connection error."""
+    try:
+        resp = requests.post(f"{API_URL}{path}", json=json, timeout=30)
+        if resp.status_code >= 400:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except ValueError:
+                detail = resp.text
+            st.error(f"La API rechazó la operación ({resp.status_code}): {detail}")
+            return None
+        return resp.json()
+    except requests.RequestException as exc:
+        st.error(f"No se pudo conectar con la API en {API_URL}{path}: {exc}")
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Header + health
 # --------------------------------------------------------------------------- #
@@ -153,9 +171,15 @@ with tab_medallion:
 
 
 # --------------------------------------------------------------------------- #
-# Tab 1: Personas (search + filters + detail)
+# Tab 1: Personas (search + filters + detail) — Gold layer only
 # --------------------------------------------------------------------------- #
 with tab_persons:
+    st.caption(
+        "Solo se muestran personas de la capa **Gold**: completitud >= 80% "
+        "(los 5 campos clave presentes) y nombre único en toda la base. "
+        "Las personas incompletas o con nombre ambiguo se revisan en la pestaña "
+        "🔗 Duplicados."
+    )
     # Page number lives in session_state so the Prev/Next buttons can update it.
     if "persons_page" not in st.session_state:
         st.session_state.persons_page = 1
@@ -203,7 +227,7 @@ with tab_persons:
     if job:
         params["job"] = job
 
-    data = api_get("/persons", params) or {"total": 0, "count": 0, "items": []}
+    data = api_get("/gold/persons", params) or {"total": 0, "count": 0, "items": []}
     total = data.get("total", 0)
     items = data.get("items", [])
     total_pages = max(1, (int(total) + int(page_size) - 1) // int(page_size))
@@ -261,8 +285,10 @@ with tab_persons:
                 st.json(detail)
     else:
         st.info(
-            "No hay personas que coincidan con la búsqueda. "
-            "Si el pipeline aún no ha procesado datos, la tabla estará vacía."
+            "No hay personas Gold que coincidan con la búsqueda. "
+            "Si el pipeline aún no ha procesado datos, o la capa Gold no se ha "
+            "refrescado todavía (`python -m hr_etl.warehouse.gold_layer`), la tabla "
+            "estará vacía."
         )
 
 
@@ -351,15 +377,52 @@ with tab_dupes:
                 f"**Motivo:** {group.get('reason', '—')}  ·  "
                 f"**{len(group['members'])} personas**"
             )
-            # Compact list of members, then full detail in columns.
-            for m in group["members"]:
-                st.write("• " + _member_label(m))
+            st.caption(
+                "Marca las personas que sean REALMENTE la misma persona y pulsa "
+                "«Consolidar seleccionadas». Los datos de todas las seleccionadas se "
+                "fusionan en una sola fila (sobrevive el id más bajo); las que dejes "
+                "sin marcar no se tocan. Útil sobre todo cuando el grupo tiene MÁS de "
+                "2 personas y la regla automática no puede decidir sola con cuál va "
+                "el caso ambiguo (p. ej. un registro sin pasaporte entre varios "
+                "homónimos con pasaporte distinto)."
+            )
 
+            # --- Detail + selection checkboxes, one column per member ---
             st.markdown("**Detalle de cada persona**")
             cols = st.columns(min(len(group["members"]), 3))
+            selected_ids: list[int] = []
             for i, m in enumerate(group["members"]):
+                pid = m["person_id"]
                 with cols[i % len(cols)]:
-                    st.caption(_member_label(m))
-                    detail = api_get(f"/persons/{m['person_id']}")
+                    checked = st.checkbox(
+                        _member_label(m), key=f"dupe_sel_{group['group_id']}_{pid}"
+                    )
+                    if checked:
+                        selected_ids.append(pid)
+                    detail = api_get(f"/persons/{pid}")
                     if detail:
                         st.json(detail)
+
+            st.divider()
+            n_selected = len(selected_ids)
+            merge_col, info_col = st.columns([1, 3])
+            with merge_col:
+                disabled = n_selected < 2
+                if st.button(
+                    f"🔗 Consolidar seleccionadas ({n_selected})",
+                    disabled=disabled,
+                    type="primary",
+                    key=f"merge_btn_{group['group_id']}",
+                ):
+                    result = api_post("/consolidate", {"person_ids": selected_ids})
+                    if result is not None:
+                        st.success(
+                            f"Consolidado: {result['merged']} fila(s) fusionada(s) en "
+                            f"una sola persona (ids {result['person_ids']}). La "
+                            "reconciliación y Gold se actualizarán en el próximo ciclo "
+                            "del DAG de mantenimiento."
+                        )
+                        st.rerun()
+            with info_col:
+                if disabled:
+                    st.caption("Selecciona al menos 2 personas para poder consolidar.")

@@ -176,6 +176,77 @@ def _create_sqlite_gold_tables(session_factory) -> None:
         session.close()
 
 
+def test_gold_persons_endpoint_lists_only_gold(sqlite_session_factory):
+    """/gold/persons reads from gold_persons, not Silver — Silver-only rows never show.
+
+    ``gold_persons`` is an ORM table (``GoldPerson``), already created by the
+    ``sqlite_session_factory`` fixture's ``Base.metadata.create_all`` — no extra setup.
+    """
+    from hr_etl.models.db_models import GoldPerson
+    from hr_etl.models.person import Person
+
+    # Silver has 2 persons; only one of them "graduated" to Gold.
+    repo = PersonRepository(sqlite_session_factory)
+    repo.upsert(Person(match_key="k1", full_name="ana gil", city="madrid", company="acme"))
+    repo.upsert(Person(match_key="k2", full_name="beatriz ruiz", city="sevilla"))
+
+    session = sqlite_session_factory()
+    try:
+        session.add(
+            GoldPerson(
+                id=999,
+                full_name="ana gil",
+                city="madrid",
+                company="acme",
+                completeness=1.0,
+            )
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    client = _client(sqlite_session_factory)
+    resp = client.get("/gold/persons")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 1
+    assert body["items"][0]["full_name"] == "ana gil"
+    assert body["items"][0]["completeness"] == 1.0
+
+
+def test_gold_persons_endpoint_filters_and_pagination(sqlite_session_factory):
+    from hr_etl.models.db_models import GoldPerson
+
+    session = sqlite_session_factory()
+    try:
+        session.add_all(
+            [
+                GoldPerson(id=1, full_name="ana gil", city="madrid", company="acme"),
+                GoldPerson(id=2, full_name="beatriz ruiz", city="sevilla", company="globex"),
+                GoldPerson(id=3, full_name="carla diaz", city="madrid", company="acme"),
+            ]
+        )
+        session.commit()
+    finally:
+        session.close()
+
+    client = _client(sqlite_session_factory)
+
+    assert client.get("/gold/persons", params={"city": "madrid"}).json()["count"] == 2
+    assert client.get("/gold/persons", params={"q": "beatriz"}).json()["total"] == 1
+
+    page = client.get("/gold/persons", params={"limit": 2, "offset": 0}).json()
+    assert page["total"] == 3
+    assert page["count"] == 2
+
+
+def test_gold_persons_endpoint_empty_when_not_refreshed(sqlite_session_factory):
+    """No error if gold_persons exists but is empty (Gold not refreshed yet)."""
+    client = _client(sqlite_session_factory)
+    body = client.get("/gold/persons").json()
+    assert body == {"total": 0, "count": 0, "limit": 50, "offset": 0, "items": []}
+
+
 def test_gold_stats_endpoint(sqlite_session_factory):
     _create_sqlite_gold_tables(sqlite_session_factory)
     from sqlalchemy import text

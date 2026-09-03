@@ -30,7 +30,7 @@ Run: python -m hr_etl.processing.consolidate_merge
 
 from __future__ import annotations
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -274,6 +274,67 @@ def run_consolidation(session: Session, merge_threshold: float = _MERGE_THRESHOL
 
     merged = int(merged)
     logger.info("consolidation done: merged=%d rows", merged)
+    try:
+        from hr_etl.metrics.prometheus import CONSOLIDATION_MERGED_ROWS
+
+        CONSOLIDATION_MERGED_ROWS.inc(merged)
+    except Exception:  # pragma: no cover - metrics are best-effort, never fail the job
+        pass
+    return merged
+
+
+def run_manual_consolidation(session: Session, person_ids: list[int]) -> int:
+    """Merge a HUMAN-CHOSEN set of person rows into one survivor. Returns rows merged away.
+
+    Unlike :func:`run_consolidation` (VÍA 1/2, fully automatic, tightly gated), this is
+    invoked from the Duplicados review pane: a person looked at a group of ambiguous
+    candidates and decided which ones are the same individual. No name-similarity or
+    passport-non-contradiction gate is re-applied here — the human's selection IS the
+    authorization to merge, which is exactly the case the automatic rules refuse to
+    guess (e.g. one nameless-passport record among several same-name candidates).
+
+    Reuses the same survivorship / transitive-closure / delete pipeline as VÍA 1/2 (root
+    = min id, first-non-null fields, longest full_name, oldest/newest timestamps), so the
+    result is consistent with automatic merges. Runs in ONE transaction; rolls back
+    entirely on error (never a partial merge). Requires >= 2 distinct, existing ids.
+    """
+    ids = sorted(set(person_ids))
+    if len(ids) < 2:
+        raise ValueError("need at least 2 distinct person ids to consolidate")
+
+    try:
+        session.execute(text(f"SET statement_timeout = {int(_STATEMENT_TIMEOUT_MS)}"))
+
+        # Verify all ids exist before touching anything (fail fast, no partial state).
+        exists_stmt = text("SELECT id FROM persons WHERE id IN :ids").bindparams(
+            bindparam("ids", expanding=True)
+        )
+        existing = set(session.execute(exists_stmt, {"ids": ids}).scalars().all())
+        missing = [i for i in ids if i not in existing]
+        if missing:
+            raise ValueError(f"person id(s) not found: {missing}")
+
+        # Link every id to the next one; the transitive closure downstream folds them
+        # all into a single component regardless of link shape (chain is enough).
+        session.execute(text("DROP TABLE IF EXISTS _cm_links"))
+        session.execute(text("CREATE TEMP TABLE _cm_links (id_a INTEGER, id_b INTEGER)"))
+        session.execute(
+            text("INSERT INTO _cm_links (id_a, id_b) VALUES (:a, :b)"),
+            [{"a": ids[i], "b": ids[i + 1]} for i in range(len(ids) - 1)],
+        )
+        session.execute(_BUILD_SURVIVOR_SQL)
+
+        merged = session.execute(_COUNT_LOSERS_SQL).scalar_one()
+        if merged:
+            session.execute(text(_build_update_sql()))
+            session.execute(_DELETE_LOSERS_SQL)
+        session.commit()
+    except (SQLAlchemyError, ValueError):
+        session.rollback()
+        raise
+
+    merged = int(merged)
+    logger.info("manual consolidation done: merged=%d rows (ids=%s)", merged, len(ids))
     try:
         from hr_etl.metrics.prometheus import CONSOLIDATION_MERGED_ROWS
 

@@ -338,3 +338,187 @@ def test_via2_single_word_name_not_merged(pg_session_factory):
         assert len(_persons(session)) == 2
     finally:
         session.close()
+
+
+# ======================================================================
+# Manual consolidation (Duplicados review pane) — the human's selection is the
+# authorization to merge. No name-similarity / passport-non-contradiction gate is
+# re-applied: this is precisely for the ambiguous cases VÍA 1/2 refuse to auto-decide
+# (e.g. a nameless-passport record among several same-name candidates, the "William
+# Traore" case with 5 different-passport homonyms + 1 passport-less record).
+# ======================================================================
+
+from hr_etl.processing.consolidate_merge import run_manual_consolidation  # noqa: E402
+
+
+def test_manual_merge_two_selected_ids(pg_session_factory):
+    """A human picks 2 of several same-name candidates; they merge like VÍA 1/2 would,
+    even though passports differ across the WIDER bucket (not checked here)."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(
+            session, "passport:wt-1", "william traore", passport="018773961", email="a@x.com"
+        )
+        b = _add_person(session, "name:wt-2", "William Traore", city="Fafe", company="Leiva-Ruiz")
+        # A third homonym with a DIFFERENT passport exists in the bucket but is NOT
+        # selected by the human, so it must be left untouched.
+        c = _add_person(session, "passport:wt-3", "william traore", passport="539971087")
+        session.commit()
+        expected_survivor = min(a.id, b.id)
+
+        merged = run_manual_consolidation(session, [a.id, b.id])
+
+        assert merged == 1
+        rows = _persons(session)
+        assert len(rows) == 2  # survivor + the untouched third homonym
+        survivor = next(r for r in rows if r.id == expected_survivor)
+        assert survivor.passport == "018773961"
+        assert survivor.city == "Fafe"
+        assert survivor.company == "Leiva-Ruiz"
+        assert survivor.email == "a@x.com"
+        # the un-selected homonym is untouched
+        untouched = next(r for r in rows if r.id == c.id)
+        assert untouched.passport == "539971087"
+    finally:
+        session.close()
+
+
+def test_manual_merge_three_selected_ids_chain(pg_session_factory):
+    """Selecting 3+ ids folds them all into the single min(id) survivor, no data lost."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:m-1", "ana gil", city="Vigo")
+        b = _add_person(session, "k:m-2", "ana gil", email="b@x.com")
+        c = _add_person(session, "k:m-3", "ana gil", company="Acme")
+        session.commit()
+        root = min(a.id, b.id, c.id)
+
+        merged = run_manual_consolidation(session, [a.id, b.id, c.id])
+
+        assert merged == 2
+        rows = _persons(session)
+        assert len(rows) == 1
+        survivor = rows[0]
+        assert survivor.id == root
+        assert survivor.city == "Vigo"
+        assert survivor.email == "b@x.com"
+        assert survivor.company == "Acme"
+    finally:
+        session.close()
+
+
+def test_manual_merge_rejects_single_id(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:solo", "ana gil")
+        session.commit()
+
+        with pytest.raises(ValueError, match="at least 2"):
+            run_manual_consolidation(session, [a.id])
+    finally:
+        session.close()
+
+
+def test_manual_merge_rejects_missing_id(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:exists", "ana gil")
+        session.commit()
+
+        with pytest.raises(ValueError, match="not found"):
+            run_manual_consolidation(session, [a.id, 999999])
+
+        # nothing was touched
+        assert len(_persons(session)) == 1
+    finally:
+        session.close()
+
+
+def test_manual_merge_deduplicates_repeated_ids(pg_session_factory):
+    """Passing the same id twice is harmless (deduped before building links)."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:d-1", "ana gil")
+        b = _add_person(session, "k:d-2", "ana gil")
+        session.commit()
+
+        merged = run_manual_consolidation(session, [a.id, b.id, a.id])
+
+        assert merged == 1
+        assert len(_persons(session)) == 1
+    finally:
+        session.close()
+
+
+# ======================================================================
+# POST /consolidate — the API endpoint wrapping run_manual_consolidation.
+# Integration (needs Postgres) because run_manual_consolidation uses temp tables /
+# array_agg / recursive CTEs — the same reason the rest of this module is Postgres-only.
+# ======================================================================
+
+
+def _api_client(session_factory):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from hr_etl.api.routes import build_router
+
+    app = FastAPI()
+    app.include_router(build_router(session_factory))
+    return TestClient(app)
+
+
+def test_consolidate_endpoint_merges_selected_ids(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "passport:api-1", "william traore", passport="018773961")
+        b = _add_person(session, "name:api-2", "William Traore", city="Fafe")
+        session.commit()
+        expected_survivor = min(a.id, b.id)
+    finally:
+        session.close()
+
+    client = _api_client(pg_session_factory)
+    resp = client.post("/consolidate", json={"person_ids": [a.id, b.id]})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["merged"] == 1
+    assert body["person_ids"] == sorted([a.id, b.id])
+
+    session = pg_session_factory()
+    try:
+        rows = _persons(session)
+        assert len(rows) == 1
+        assert rows[0].id == expected_survivor
+        assert rows[0].city == "Fafe"
+    finally:
+        session.close()
+
+
+def test_consolidate_endpoint_rejects_single_id(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:api-solo", "ana gil")
+        session.commit()
+    finally:
+        session.close()
+
+    client = _api_client(pg_session_factory)
+    # Pydantic min_length=2 rejects a single-id payload before the handler even runs.
+    resp = client.post("/consolidate", json={"person_ids": [a.id]})
+    assert resp.status_code == 422
+
+
+def test_consolidate_endpoint_rejects_missing_id(pg_session_factory):
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:api-exists", "ana gil")
+        session.commit()
+    finally:
+        session.close()
+
+    client = _api_client(pg_session_factory)
+    resp = client.post("/consolidate", json={"person_ids": [a.id, 999999]})
+    assert resp.status_code == 400
+    assert "not found" in resp.json()["detail"]
