@@ -8,13 +8,37 @@ from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
 
-from hr_etl.models.db_models import DuplicateGroup, GoldPerson, MatchCandidate, PersonRow
+from hr_etl.models.db_models import (
+    DuplicateGroup,
+    GoldPerson,
+    MatchCandidate,
+    PersonReview,
+    PersonRow,
+)
 
 
 class ConsolidateRequest(BaseModel):
-    """Payload for POST /consolidate: person ids a human chose to merge."""
+    """Payload for POST /consolidate: the exactly-two person ids a human chose to merge.
 
-    person_ids: list[int] = Field(..., min_length=2, description="Ids to merge (>= 2)")
+    Consolidation is reviewed pairwise (the reviewer compares two concrete records), so
+    the request carries exactly two ids; the UI enforces the same cap.
+    """
+
+    person_ids: list[int] = Field(
+        ..., min_length=2, max_length=2, description="Exactly 2 ids to merge"
+    )
+
+
+class ReviewRequest(BaseModel):
+    """Payload for POST /review/*: a single person a reviewer resolved.
+
+    ``person_id`` is the Silver row the reviewer acted on; the endpoint resolves its
+    stable ``match_key`` and records the verdict in ``person_reviews`` so it survives a
+    reprocess. ``note`` is an optional free-text annotation.
+    """
+
+    person_id: int = Field(..., description="Silver person id the reviewer resolved")
+    note: str | None = Field(None, max_length=255, description="Optional annotation")
 
 
 def _row_to_dict(row: PersonRow) -> dict:
@@ -357,6 +381,55 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
             return {"merged": merged, "person_ids": sorted(set(payload.person_ids))}
         finally:
             session.close()
+
+    def _record_review(person_id: int, status: str, note: str | None) -> dict:
+        """Resolve a person's stable match_key and upsert a person_reviews verdict.
+
+        Shared by /review/approve and /review/distinct. Keyed by ``match_key`` so the
+        decision survives a reprocess (persons.id churns; match_key does not). Idempotent:
+        re-reviewing the same person overwrites the prior verdict. 404 if the id is gone
+        (e.g. already merged away), 400 if the row has no match_key.
+        """
+        session = session_factory()
+        try:
+            person = session.get(PersonRow, person_id)
+            if person is None:
+                raise HTTPException(status_code=404, detail=f"person {person_id} not found")
+            if not person.match_key:
+                raise HTTPException(status_code=400, detail=f"person {person_id} has no match_key")
+            existing = session.execute(
+                select(PersonReview).where(PersonReview.match_key == person.match_key)
+            ).scalar_one_or_none()
+            if existing is None:
+                session.add(PersonReview(match_key=person.match_key, status=status, note=note))
+            else:
+                existing.status = status
+                existing.survivor_match_key = None
+                existing.note = note
+            session.commit()
+            return {"person_id": person_id, "match_key": person.match_key, "status": status}
+        finally:
+            session.close()
+
+    @router.post("/review/approve")
+    def review_approve(payload: ReviewRequest) -> dict:
+        """Approve a person as the canonical record (force-promote to Gold).
+
+        Records status ``approved`` in ``person_reviews``. On the next Gold refresh the
+        row is promoted even if its name repeats in Silver (the automatic name-uniqueness
+        gate is bypassed for approved rows), and reconcile stops surfacing it for review.
+        """
+        return _record_review(payload.person_id, "approved", payload.note)
+
+    @router.post("/review/distinct")
+    def review_distinct(payload: ReviewRequest) -> dict:
+        """Mark a person as a DIFFERENT real individual that merely shares a name.
+
+        Records status ``distinct`` in ``person_reviews``. The row leaves the review queue
+        and is ignored by the Gold name-uniqueness anti-join, so its legitimate same-name
+        peers are no longer blocked from Gold. The row itself is not auto-promoted.
+        """
+        return _record_review(payload.person_id, "distinct", payload.note)
 
     @router.get("/gold/stats")
     def gold_stats() -> dict:

@@ -378,41 +378,87 @@ with tab_dupes:
                 f"**{len(group['members'])} personas**"
             )
             st.caption(
-                "Marca las personas que sean REALMENTE la misma persona y pulsa "
-                "«Consolidar seleccionadas». Los datos de todas las seleccionadas se "
-                "fusionan en una sola fila (sobrevive el id más bajo); las que dejes "
-                "sin marcar no se tocan. Útil sobre todo cuando el grupo tiene MÁS de "
-                "2 personas y la regla automática no puede decidir sola con cuál va "
-                "el caso ambiguo (p. ej. un registro sin pasaporte entre varios "
-                "homónimos con pasaporte distinto)."
+                "Tres formas de resolver un caso, todas persistentes (sobreviven al "
+                "reprocesado y al rebuild de la reconciliación):\n\n"
+                "- **Consolidar (exactamente 2):** marca las dos filas que sean la "
+                "MISMA persona; se fusionan en una (sobrevive el id más bajo) y se "
+                "guarda la traza del merge.\n"
+                "- **✅ Aprobar como canónica:** esta fila es la buena y ya está "
+                "completa; se promociona a Gold aunque el nombre se repita.\n"
+                "- **🔀 Marcar como distinta:** es otra persona real con el mismo "
+                "nombre (homónimo); sale de la cola y deja de bloquear a sus pares."
             )
 
-            # --- Detail + selection checkboxes, one column per member ---
+            # --- Detail + per-member actions, one column per member ---
             st.markdown("**Detalle de cada persona**")
-            cols = st.columns(min(len(group["members"]), 3))
+            gid = group["group_id"]
+            members = group["members"]
+            cols = st.columns(min(len(members), 3))
+
+            # Enforce a STRICT cap of 2 selected checkboxes for consolidation. We read the
+            # current selection from session_state and disable the unchecked boxes once two
+            # are already ticked, so a third can never be selected.
+            sel_key = lambda pid: f"dupe_sel_{gid}_{pid}"  # noqa: E731
+            currently_selected = [
+                m["person_id"] for m in members if st.session_state.get(sel_key(m["person_id"]))
+            ]
+            cap_reached = len(currently_selected) >= 2
+
             selected_ids: list[int] = []
-            for i, m in enumerate(group["members"]):
+            for i, m in enumerate(members):
                 pid = m["person_id"]
                 with cols[i % len(cols)]:
+                    is_selected = st.session_state.get(sel_key(pid), False)
                     checked = st.checkbox(
-                        _member_label(m), key=f"dupe_sel_{group['group_id']}_{pid}"
+                        _member_label(m),
+                        key=sel_key(pid),
+                        # disable the box only if the cap is hit AND this box is unticked
+                        disabled=cap_reached and not is_selected,
                     )
                     if checked:
                         selected_ids.append(pid)
                     detail = api_get(f"/persons/{pid}")
                     if detail:
                         st.json(detail)
+                    # Per-member review actions (single person each).
+                    a_col, d_col = st.columns(2)
+                    with a_col:
+                        if st.button(
+                            "✅ Aprobar",
+                            key=f"approve_{gid}_{pid}",
+                            help="Marcar como canónica y promover a Gold",
+                        ):
+                            res = api_post("/review/approve", {"person_id": pid})
+                            if res is not None:
+                                st.success(
+                                    f"#{pid} aprobada como canónica. Entrará a Gold en el "
+                                    "próximo refresh."
+                                )
+                                st.rerun()
+                    with d_col:
+                        if st.button(
+                            "🔀 Distinta",
+                            key=f"distinct_{gid}_{pid}",
+                            help="Es otra persona con el mismo nombre (homónimo)",
+                        ):
+                            res = api_post("/review/distinct", {"person_id": pid})
+                            if res is not None:
+                                st.success(
+                                    f"#{pid} marcada como persona distinta. Sale de la cola "
+                                    "de duplicados."
+                                )
+                                st.rerun()
 
             st.divider()
             n_selected = len(selected_ids)
             merge_col, info_col = st.columns([1, 3])
             with merge_col:
-                disabled = n_selected < 2
+                disabled = n_selected != 2
                 if st.button(
-                    f"🔗 Consolidar seleccionadas ({n_selected})",
+                    f"🔗 Consolidar seleccionadas ({n_selected}/2)",
                     disabled=disabled,
                     type="primary",
-                    key=f"merge_btn_{group['group_id']}",
+                    key=f"merge_btn_{gid}",
                 ):
                     result = api_post("/consolidate", {"person_ids": selected_ids})
                     if result is not None:
@@ -424,5 +470,7 @@ with tab_dupes:
                         )
                         st.rerun()
             with info_col:
-                if disabled:
-                    st.caption("Selecciona al menos 2 personas para poder consolidar.")
+                if n_selected < 2:
+                    st.caption("Selecciona exactamente 2 personas para consolidar.")
+                elif cap_reached:
+                    st.caption("Máximo 2 seleccionadas. Desmarca una para elegir otra.")

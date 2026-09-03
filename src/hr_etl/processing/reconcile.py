@@ -95,20 +95,48 @@ _BACKFILL_NORM_SQL = text(
     """
 )
 
+# Ensure the human-review table exists before Phase 1 filters against it. Normally created
+# by init_schema (ORM create_all); this idempotent DDL keeps run_reconciliation correct when
+# called directly (tests, ad-hoc runs). Portable to Postgres and SQLite.
+_ENSURE_REVIEWS_TABLE_SQL = text(
+    """
+    CREATE TABLE IF NOT EXISTS person_reviews (
+        id INTEGER PRIMARY KEY,
+        match_key VARCHAR(255) UNIQUE,
+        status VARCHAR(32),
+        survivor_match_key VARCHAR(255),
+        note VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    """
+)
+
 # ---------------------------------------------------------------------------
 # Phase 1 — eligible persons (name >= 2 words), and a catalog of DISTINCT names.
 # Collapsing to distinct names is the scale lever: millions of rows -> far fewer names, so
 # the fuzzy/containment comparison never re-does work on repeated names.
 # ---------------------------------------------------------------------------
+#
+# Persons already RESOLVED by a human (person_reviews) are excluded from the eligible set,
+# so a reviewer's verdict is sticky across the 30-min full rebuild: an 'approved' canonical,
+# a 'distinct' homonym, or a 'merged' loser never resurfaces in the review pane. The join is
+# by ``match_key`` (the stable business key) — persons.id churns on reprocess, match_key does
+# not — so the decision holds even after a truncate + reload from the lake.
 _BUILD_PN_SQL = text(
     f"""
     DROP TABLE IF EXISTS _recon_pn;
     CREATE TEMP TABLE _recon_pn AS
         SELECT id, norm_name AS norm, passport
-        FROM persons
+        FROM persons p
         WHERE norm_name IS NOT NULL
           AND length(norm_name) >= 3
-          AND array_length(regexp_split_to_array(norm_name, ' '), 1) >= {_MIN_NAME_TOKENS};
+          AND array_length(regexp_split_to_array(norm_name, ' '), 1) >= {_MIN_NAME_TOKENS}
+          AND NOT EXISTS (
+              SELECT 1 FROM person_reviews r
+              WHERE r.match_key = p.match_key
+                AND r.status IN ('approved', 'distinct', 'merged')
+          );
     CREATE INDEX _recon_pn_norm ON _recon_pn (norm);
     ANALYZE _recon_pn;
     """
@@ -339,7 +367,9 @@ def run_reconciliation(
         # Clear previous groups INSIDE the rebuild transaction so the table is never
         # observed empty: a failed detect rolls back and restores the old groups.
         session.execute(delete(DuplicateGroup))
-        # Phase 0: ensure norm_name is materialized (guarded no-op once populated).
+        # Phase 0: ensure norm_name is materialized (guarded no-op once populated) and the
+        # human-review table exists (Phase 1 excludes already-resolved match_keys).
+        session.execute(_ENSURE_REVIEWS_TABLE_SQL)
         session.execute(_BACKFILL_NORM_SQL)
         # Phase 1: eligible persons + distinct-name catalog.
         session.execute(_BUILD_PN_SQL)

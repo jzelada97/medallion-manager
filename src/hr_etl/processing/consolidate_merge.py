@@ -244,6 +244,53 @@ _DELETE_LOSERS_SQL = text("DELETE FROM persons WHERE id IN (SELECT loser_id FROM
 
 _COUNT_LOSERS_SQL = text("SELECT count(*) FROM _cm_survivor;")
 
+# Ensure the human-review/decision table exists before the manual merge writes to it.
+# Normally created by init_schema (ORM create_all); this idempotent DDL keeps the job
+# self-sufficient. Portable to Postgres and SQLite.
+_ENSURE_REVIEWS_TABLE_SQL = text(
+    """
+    CREATE TABLE IF NOT EXISTS person_reviews (
+        id INTEGER PRIMARY KEY,
+        match_key VARCHAR(255) UNIQUE,
+        status VARCHAR(32),
+        survivor_match_key VARCHAR(255),
+        note VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+    -- If the ORM created the table first (create_all, no server default on updated_at),
+    -- ensure the DB-side default so the raw-SQL INSERT below never hits a NOT NULL
+    -- violation. Idempotent; harmless if the default is already present.
+    ALTER TABLE person_reviews ALTER COLUMN updated_at SET DEFAULT NOW();
+    """
+)
+
+# Record the merge decision in person_reviews (keyed by the loser's stable match_key,
+# pointing at the survivor's stable match_key) BEFORE the loser row is deleted. Only used
+# by run_manual_consolidation — the automatic VÍA 1/2 job does NOT write decisions (its
+# merges are pure data cleanup that a reprocess reproduces deterministically, so they need
+# no sticky human verdict). Delete-then-insert keeps it idempotent under UNIQUE(match_key).
+_RECORD_MERGE_DECISION_SQL = text(
+    """
+    DELETE FROM person_reviews
+    WHERE match_key IN (
+        SELECT pl.match_key
+        FROM _cm_survivor s
+        JOIN persons pl ON pl.id = s.loser_id
+        WHERE pl.match_key IS NOT NULL
+    );
+    INSERT INTO person_reviews (match_key, status, survivor_match_key, note)
+    SELECT pl.match_key,
+           'merged',
+           ps.match_key,
+           'manual consolidation'
+    FROM _cm_survivor s
+    JOIN persons pl ON pl.id = s.loser_id
+    JOIN persons ps ON ps.id = s.survivor_id
+    WHERE pl.match_key IS NOT NULL;
+    """
+)
+
 
 def run_consolidation(session: Session, merge_threshold: float = _MERGE_THRESHOLD) -> int:
     """Merge same-person rows (same passport + similar name). Returns rows merged away.
@@ -296,14 +343,24 @@ def run_manual_consolidation(session: Session, person_ids: list[int]) -> int:
     Reuses the same survivorship / transitive-closure / delete pipeline as VÍA 1/2 (root
     = min id, first-non-null fields, longest full_name, oldest/newest timestamps), so the
     result is consistent with automatic merges. Runs in ONE transaction; rolls back
-    entirely on error (never a partial merge). Requires >= 2 distinct, existing ids.
+    entirely on error (never a partial merge).
+
+    Requires EXACTLY 2 distinct, existing ids: consolidation is reviewed pairwise so the
+    reviewer always compares two concrete records side by side (the UI enforces the same
+    cap). Before deleting the loser, an audit/decision row is written to ``person_reviews``
+    (status ``merged``, ``survivor_match_key`` = the survivor's key) so the decision is
+    persistent and survives a reprocess: reconcile keeps the loser's match_key out of the
+    review pane instead of resurfacing it after the loser row is re-created from the lake.
     """
     ids = sorted(set(person_ids))
-    if len(ids) < 2:
-        raise ValueError("need at least 2 distinct person ids to consolidate")
+    if len(ids) != 2:
+        raise ValueError("need exactly 2 distinct person ids to consolidate")
 
     try:
         session.execute(text(f"SET statement_timeout = {int(_STATEMENT_TIMEOUT_MS)}"))
+        # Ensure the decision table exists (normally created by init_schema; keeps the
+        # manual merge self-sufficient). Idempotent, portable to Postgres and SQLite.
+        session.execute(_ENSURE_REVIEWS_TABLE_SQL)
 
         # Verify all ids exist before touching anything (fail fast, no partial state).
         exists_stmt = text("SELECT id FROM persons WHERE id IN :ids").bindparams(
@@ -327,6 +384,12 @@ def run_manual_consolidation(session: Session, person_ids: list[int]) -> int:
         merged = session.execute(_COUNT_LOSERS_SQL).scalar_one()
         if merged:
             session.execute(text(_build_update_sql()))
+            # Persist the decision BEFORE deleting the loser: map each loser's stable
+            # match_key to the survivor's stable match_key (both read from persons while
+            # the loser row still exists). Idempotent per loser key (delete-then-insert
+            # avoids a UNIQUE(match_key) conflict if a prior decision existed). Portable
+            # to Postgres and SQLite (no ON CONFLICT / RETURNING).
+            session.execute(_RECORD_MERGE_DECISION_SQL)
             session.execute(_DELETE_LOSERS_SQL)
         session.commit()
     except (SQLAlchemyError, ValueError):

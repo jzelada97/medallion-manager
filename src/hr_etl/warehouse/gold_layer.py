@@ -26,6 +26,22 @@ _BACKFILL_NORM_SQL = (
     "WHERE full_name IS NOT NULL AND (norm_name IS NULL OR norm_name = '');"
 )
 
+# Ensure the human-review table exists before the Gold predicate references it. Normally
+# created by init_schema (ORM create_all), but refresh_gold is also called directly (tests,
+# ad-hoc refreshes) — this idempotent DDL keeps it self-sufficient. Portable to Postgres
+# and SQLite (both accept CREATE TABLE IF NOT EXISTS + these column types).
+_ENSURE_REVIEWS_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS person_reviews (
+    id INTEGER PRIMARY KEY,
+    match_key VARCHAR(255) UNIQUE,
+    status VARCHAR(32),
+    survivor_match_key VARCHAR(255),
+    note VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+"""
+
 # SQL statements to create Gold views/tables.
 # Using materialized-style approach: real tables that get TRUNCATE + INSERT on refresh.
 
@@ -99,14 +115,40 @@ _FILLED_COUNT = " + ".join(
 # ``ix_persons_norm_name``. (An earlier `id NOT IN (SELECT ...)` variant against
 # duplicate_groups planned as a per-row SubPlan over 859k rows — cost ~1.1e10, > 8 min;
 # NOT EXISTS plans as a Hash Anti Join.) `persons` is aliased `p` in the rebuild.
-_GOLD_PREDICATE = (
+#
+# HUMAN-REVIEW OVERRIDE (person_reviews, keyed by the stable match_key):
+#   * ``approved`` — a reviewer confirmed this exact row is the canonical person; it is
+#     force-promoted to Gold even if its name repeats (the automatic uniqueness test is
+#     bypassed for it). This is the "I checked it, it's the good one" verdict.
+#   * ``distinct`` — a reviewer confirmed a row is a DIFFERENT real person that merely
+#     shares a name (a legitimate homonym). Such rows are EXCLUDED from the collision
+#     count, so they no longer block their same-name peers from Gold. A ``distinct`` row
+#     is not itself auto-promoted (it still shares a name), only stops being an obstacle.
+# The override joins person_reviews by match_key (its stable business key), so decisions
+# survive a full reprocess even though persons.id churns.
+_APPROVED_PREDICATE = (
+    "EXISTS (SELECT 1 FROM person_reviews r "
+    "        WHERE r.match_key = p.match_key AND r.status = 'approved')"
+)
+
+# Automatic bar: five business fields + >= 7/8 completeness + a unique norm_name. The
+# uniqueness anti-join ignores peers that a human marked 'distinct' (legitimate homonyms),
+# so resolving one member of a same-name pair can free the other for Gold.
+_AUTO_PREDICATE = (
     "p.full_name IS NOT NULL AND p.passport IS NOT NULL AND p.email IS NOT NULL "
     "AND p.city IS NOT NULL AND p.company IS NOT NULL "
     f"AND ({_FILLED_COUNT}) >= 7 "
     "AND p.norm_name IS NOT NULL "
     "AND NOT EXISTS (SELECT 1 FROM persons p2 "
-    "                WHERE p2.norm_name = p.norm_name AND p2.id <> p.id)"
+    "                WHERE p2.norm_name = p.norm_name AND p2.id <> p.id "
+    "                  AND NOT EXISTS (SELECT 1 FROM person_reviews r2 "
+    "                                  WHERE r2.match_key = p2.match_key "
+    "                                    AND r2.status = 'distinct'))"
 )
+
+# A row is Gold if a human approved it OR it clears the automatic bar. The approved branch
+# wins regardless of name repetition; the auto branch keeps the strict uniqueness guarantee.
+_GOLD_PREDICATE = f"(({_APPROVED_PREDICATE}) OR ({_AUTO_PREDICATE}))"
 
 # Rebuild gold_persons: only records that clear the Gold bar. Full DELETE + INSERT so it
 # is idempotent (a re-run reproduces the same set). completeness stored for transparency.
@@ -212,8 +254,14 @@ def refresh_gold(engine: Engine) -> int:
     streaming + reconcile, but we run a guarded backfill first so refresh_gold is correct
     on its own (e.g. right after a fresh load, or in tests) and never silently drops a row
     just because its norm_name was not yet computed. WHERE-indexed no-op once populated.
+
+    Human review overrides (person_reviews): an ``approved`` row is force-promoted even if
+    its name repeats; a ``distinct`` peer is ignored by the uniqueness anti-join so it no
+    longer blocks its same-name twin. The review table is ensured to exist first so this
+    stays self-sufficient outside the full init_schema path.
     """
     with engine.begin() as conn:
+        conn.execute(text(_ENSURE_REVIEWS_TABLE_SQL))
         conn.execute(text(_BACKFILL_NORM_SQL))
         conn.execute(text(_REBUILD_GOLD_PERSONS))
         conn.execute(text(_REFRESH_STATS))

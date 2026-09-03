@@ -128,3 +128,49 @@ class GoldPerson(Base):
     ipv4: Mapped[str | None] = mapped_column(String(64), nullable=True)
     completeness: Mapped[float] = mapped_column(Float, default=0.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PersonReview(Base):
+    """A persistent HUMAN decision about a person record in the duplicate-review flow.
+
+    The duplicate-consolidation flow surfaces ambiguous same-name candidates that the
+    automatic rules refuse to merge. A reviewer resolves each case with one of three
+    verdicts, recorded here so the decision SURVIVES a full reprocess from the lake and
+    the 30-min ``duplicate_groups`` rebuild:
+
+    * ``merged``   — this record was manually merged into another. ``survivor_match_key``
+      points at the survivor. (The physical loser row is deleted by the merge; this row
+      is the audit trace so a reprocess can re-merge / keep it out of review.)
+    * ``approved`` — a reviewer confirmed this is the canonical, valid person. It is
+      force-promoted to Gold even if its name repeats in Silver, and it leaves the
+      review queue.
+    * ``distinct`` — a reviewer confirmed this is a DIFFERENT real person that merely
+      shares a name (a legitimate homonym). It leaves the review queue and no longer
+      blocks its same-name peers from Gold.
+
+    Keyed by ``match_key`` (the deterministic, content-derived business key) rather than
+    ``persons.id`` on purpose: ``persons.id`` is an autoincrement surrogate that would be
+    reassigned by a truncate + reload, whereas ``match_key`` is reproduced identically
+    from the same raw fragment. So the decision stays anchored across reprocessing.
+    """
+
+    __tablename__ = "person_reviews"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    # Stable, content-derived key of the reviewed person (survives a reprocess).
+    match_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    # 'merged' | 'approved' | 'distinct'
+    status: Mapped[str] = mapped_column(String(32), index=True)
+    # For 'merged': the match_key of the survivor this record was folded into.
+    survivor_match_key: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    # Optional free-text note (who/why). No PII beyond the key already stored.
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # server_default so raw-SQL INSERTs (the merge-decision trace in consolidate_merge)
+    # populate it too; onupdate keeps it fresh on ORM updates (the review endpoints).
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )

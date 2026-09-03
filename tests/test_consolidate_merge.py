@@ -383,26 +383,20 @@ def test_manual_merge_two_selected_ids(pg_session_factory):
         session.close()
 
 
-def test_manual_merge_three_selected_ids_chain(pg_session_factory):
-    """Selecting 3+ ids folds them all into the single min(id) survivor, no data lost."""
+def test_manual_merge_rejects_three_ids(pg_session_factory):
+    """Consolidation is reviewed PAIRWISE: more than 2 ids is rejected (exactly-2 rule)."""
     session = pg_session_factory()
     try:
         a = _add_person(session, "k:m-1", "ana gil", city="Vigo")
         b = _add_person(session, "k:m-2", "ana gil", email="b@x.com")
         c = _add_person(session, "k:m-3", "ana gil", company="Acme")
         session.commit()
-        root = min(a.id, b.id, c.id)
 
-        merged = run_manual_consolidation(session, [a.id, b.id, c.id])
+        with pytest.raises(ValueError, match="exactly 2"):
+            run_manual_consolidation(session, [a.id, b.id, c.id])
 
-        assert merged == 2
-        rows = _persons(session)
-        assert len(rows) == 1
-        survivor = rows[0]
-        assert survivor.id == root
-        assert survivor.city == "Vigo"
-        assert survivor.email == "b@x.com"
-        assert survivor.company == "Acme"
+        # nothing was touched — all three rows remain
+        assert len(_persons(session)) == 3
     finally:
         session.close()
 
@@ -413,7 +407,7 @@ def test_manual_merge_rejects_single_id(pg_session_factory):
         a = _add_person(session, "k:solo", "ana gil")
         session.commit()
 
-        with pytest.raises(ValueError, match="at least 2"):
+        with pytest.raises(ValueError, match="exactly 2"):
             run_manual_consolidation(session, [a.id])
     finally:
         session.close()
@@ -522,3 +516,110 @@ def test_consolidate_endpoint_rejects_missing_id(pg_session_factory):
     resp = client.post("/consolidate", json={"person_ids": [a.id, 999999]})
     assert resp.status_code == 400
     assert "not found" in resp.json()["detail"]
+
+
+# ======================================================================
+# person_reviews — the persistent human-decision trace/verdicts.
+# Integration (Postgres): person_reviews is created by init_schema and the manual
+# merge writes a raw-SQL 'merged' trace; the review endpoints upsert verdicts.
+# ======================================================================
+def _reviews(session) -> list:
+    from hr_etl.models.db_models import PersonReview
+
+    session.expire_all()
+    return session.query(PersonReview).order_by(PersonReview.match_key).all()
+
+
+def test_manual_merge_writes_merged_trace(pg_session_factory):
+    """A manual merge records a 'merged' row in person_reviews for the deleted loser,
+    pointing at the survivor's stable match_key (the audit/decision trace)."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "passport:trace-1", "leo diaz", passport="T1")
+        b = _add_person(session, "name:trace-2", "Leo Diaz", city="Leon")
+        session.commit()
+        survivor_key = min((a.id, "passport:trace-1"), (b.id, "name:trace-2"))[1]
+        loser_key = max((a.id, "passport:trace-1"), (b.id, "name:trace-2"))[1]
+
+        run_manual_consolidation(session, [a.id, b.id])
+    finally:
+        session.close()
+
+    session = pg_session_factory()
+    try:
+        reviews = _reviews(session)
+        merged_rows = [r for r in reviews if r.status == "merged"]
+        assert len(merged_rows) == 1
+        assert merged_rows[0].match_key == loser_key
+        assert merged_rows[0].survivor_match_key == survivor_key
+    finally:
+        session.close()
+
+
+def test_consolidate_endpoint_rejects_three_ids(pg_session_factory):
+    """The endpoint caps the payload at exactly 2 ids (Pydantic max_length=2 -> 422)."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "k:api3-1", "ana gil")
+        b = _add_person(session, "k:api3-2", "ana gil")
+        c = _add_person(session, "k:api3-3", "ana gil")
+        session.commit()
+    finally:
+        session.close()
+
+    client = _api_client(pg_session_factory)
+    resp = client.post("/consolidate", json={"person_ids": [a.id, b.id, c.id]})
+    assert resp.status_code == 422
+
+
+def test_review_approve_endpoint_records_verdict(pg_session_factory):
+    """POST /review/approve upserts an 'approved' verdict keyed by the person's match_key."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "passport:appr-1", "nora vidal", passport="A1")
+        session.commit()
+    finally:
+        session.close()
+
+    client = _api_client(pg_session_factory)
+    resp = client.post("/review/approve", json={"person_id": a.id})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "approved"
+    assert body["match_key"] == "passport:appr-1"
+
+    session = pg_session_factory()
+    try:
+        reviews = _reviews(session)
+        assert any(r.match_key == "passport:appr-1" and r.status == "approved" for r in reviews)
+    finally:
+        session.close()
+
+
+def test_review_distinct_endpoint_records_verdict(pg_session_factory):
+    """POST /review/distinct upserts a 'distinct' verdict keyed by the person's match_key."""
+    session = pg_session_factory()
+    try:
+        a = _add_person(session, "name:dist-1", "nora vidal")
+        session.commit()
+    finally:
+        session.close()
+
+    client = _api_client(pg_session_factory)
+    resp = client.post("/review/distinct", json={"person_id": a.id})
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "distinct"
+
+    session = pg_session_factory()
+    try:
+        reviews = _reviews(session)
+        assert any(r.match_key == "name:dist-1" and r.status == "distinct" for r in reviews)
+    finally:
+        session.close()
+
+
+def test_review_endpoint_rejects_missing_person(pg_session_factory):
+    """Reviewing a non-existent person id returns 404."""
+    client = _api_client(pg_session_factory)
+    resp = client.post("/review/approve", json={"person_id": 987654})
+    assert resp.status_code == 404
