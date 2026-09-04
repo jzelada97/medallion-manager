@@ -54,23 +54,28 @@ pytestmark = [
 ]
 
 
+_GOLD_AGG_TABLES = (
+    "gold_stats",
+    "gold_top_cities",
+    "gold_top_companies",
+    "gold_completeness",
+    "gold_duplicate_groups",
+)
+
+
 @pytest.fixture()
 def pg_engine():
     engine = create_db_engine(DSN)
     # Clean schema so Gold aggregates only reflect this test's rows.
     with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS gold_stats"))
-        conn.execute(text("DROP TABLE IF EXISTS gold_top_cities"))
-        conn.execute(text("DROP TABLE IF EXISTS gold_top_companies"))
-        conn.execute(text("DROP TABLE IF EXISTS gold_completeness"))
+        for tbl in _GOLD_AGG_TABLES:
+            conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
     Base.metadata.drop_all(engine)
     init_schema(engine)
     yield engine
     with engine.begin() as conn:
-        conn.execute(text("DROP TABLE IF EXISTS gold_stats"))
-        conn.execute(text("DROP TABLE IF EXISTS gold_top_cities"))
-        conn.execute(text("DROP TABLE IF EXISTS gold_top_companies"))
-        conn.execute(text("DROP TABLE IF EXISTS gold_completeness"))
+        for tbl in _GOLD_AGG_TABLES:
+            conn.execute(text(f"DROP TABLE IF EXISTS {tbl}"))
     Base.metadata.drop_all(engine)
     engine.dispose()
 
@@ -329,3 +334,161 @@ def test_repeated_name_excluded_from_gold(pg_engine):
         ids = [r.id for r in conn.execute(text("SELECT id FROM gold_persons ORDER BY id"))]
 
     assert ids == [unique_id]  # only the unique-named person is Gold; the two dupes excluded
+
+
+# ----------------------------------------------------------------------
+# gold_duplicate_groups — the pre-aggregated duplicate-review groups that the
+# /groups endpoint reads (materialized by refresh_gold, one row per group with
+# members as JSON). Replaces the old JOIN-and-bundle-in-Python path.
+# ----------------------------------------------------------------------
+
+
+def _add_dupe_group(session, group_id: int, members: list[tuple[int, float, str]]) -> None:
+    """Insert duplicate_groups rows: members is a list of (person_id, confidence, reason)."""
+    for person_id, confidence, reason in members:
+        session.execute(
+            text(
+                "INSERT INTO duplicate_groups (group_id, person_id, confidence, reason) "
+                "VALUES (:g, :p, :c, :r)"
+            ),
+            {"g": group_id, "p": person_id, "c": confidence, "r": reason},
+        )
+
+
+def test_refresh_materializes_duplicate_groups(pg_engine):
+    """refresh_gold fills gold_duplicate_groups: one row per group, member_count,
+    max_confidence, a representative reason, and the members resolved as JSON."""
+    init_gold_schema(pg_engine)
+    prefix = uuid.uuid4().hex[:6]
+    from hr_etl.warehouse.engine import make_session_factory
+
+    session = make_session_factory(pg_engine)()
+    try:
+        a = PersonRow(match_key=f"passport:{prefix}-a", full_name="ana gil", city="madrid")
+        b = PersonRow(match_key=f"name:{prefix}-b", full_name="Ana Gil", company="acme")
+        session.add_all([a, b])
+        session.commit()
+        a_id, b_id = a.id, b.id
+        _add_dupe_group(session, a_id, [(a_id, 1.0, "exact_name"), (b_id, 1.0, "exact_name")])
+        session.commit()
+    finally:
+        session.close()
+
+    refresh_gold(pg_engine)
+
+    with pg_engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT group_id, member_count, max_confidence, reason, members "
+                "FROM gold_duplicate_groups WHERE group_id = :g"
+            ),
+            {"g": a_id},
+        ).fetchone()
+
+    assert row is not None
+    assert row.member_count == 2
+    assert row.max_confidence == pytest.approx(1.0)
+    assert row.reason == "exact_name"
+    member_ids = sorted(m["person_id"] for m in row.members)
+    assert member_ids == sorted([a_id, b_id])
+    # member payload carries the person's display fields for the UI.
+    by_id = {m["person_id"]: m for m in row.members}
+    assert by_id[a_id]["city"] == "madrid"
+    assert by_id[b_id]["company"] == "acme"
+
+
+def test_refresh_duplicate_groups_drops_singletons(pg_engine):
+    """A group with a single member is not a duplicate and is excluded (HAVING >= 2)."""
+    init_gold_schema(pg_engine)
+    prefix = uuid.uuid4().hex[:6]
+    from hr_etl.warehouse.engine import make_session_factory
+
+    session = make_session_factory(pg_engine)()
+    try:
+        solo = PersonRow(match_key=f"passport:{prefix}-solo", full_name="uno solo")
+        session.add(solo)
+        session.commit()
+        _add_dupe_group(session, solo.id, [(solo.id, 0.9, "fuzzy_name")])
+        session.commit()
+    finally:
+        session.close()
+
+    refresh_gold(pg_engine)
+
+    with pg_engine.connect() as conn:
+        n = conn.execute(text("SELECT COUNT(*) FROM gold_duplicate_groups")).scalar()
+
+    assert n == 0  # the singleton group is not materialized
+
+
+def test_refresh_duplicate_groups_excludes_reviewed(pg_engine):
+    """A member already resolved in person_reviews (approved/distinct/merged) is excluded,
+    so a group a human settled stops surfacing — even without a fresh reconcile."""
+    init_gold_schema(pg_engine)
+    prefix = uuid.uuid4().hex[:6]
+    from hr_etl.warehouse.engine import make_session_factory
+
+    session = make_session_factory(pg_engine)()
+    try:
+        a = PersonRow(match_key=f"passport:{prefix}-a", full_name="ana gil")
+        b = PersonRow(match_key=f"name:{prefix}-b", full_name="Ana Gil")
+        c = PersonRow(match_key=f"passport:{prefix}-c", full_name="ana gil")
+        session.add_all([a, b, c])
+        session.commit()
+        gid = a.id
+        _add_dupe_group(
+            session,
+            gid,
+            [(a.id, 1.0, "exact_name"), (b.id, 1.0, "exact_name"), (c.id, 1.0, "exact_name")],
+        )
+        # A human marked B as a distinct person -> B drops out of the pending group.
+        session.execute(
+            text("INSERT INTO person_reviews (match_key, status) VALUES (:mk, 'distinct')"),
+            {"mk": f"name:{prefix}-b"},
+        )
+        session.commit()
+        a_id, c_id = a.id, c.id
+    finally:
+        session.close()
+
+    refresh_gold(pg_engine)
+
+    with pg_engine.connect() as conn:
+        row = conn.execute(
+            text("SELECT member_count, members FROM gold_duplicate_groups WHERE group_id = :g"),
+            {"g": gid},
+        ).fetchone()
+
+    # B is excluded; the group keeps A and C (still >= 2, still a pending duplicate).
+    assert row is not None
+    assert row.member_count == 2
+    assert sorted(m["person_id"] for m in row.members) == sorted([a_id, c_id])
+
+
+def test_refresh_duplicate_groups_is_rebuild(pg_engine):
+    """A second refresh fully rebuilds the table (DELETE + INSERT), no duplicate rows."""
+    init_gold_schema(pg_engine)
+    prefix = uuid.uuid4().hex[:6]
+    from hr_etl.warehouse.engine import make_session_factory
+
+    session = make_session_factory(pg_engine)()
+    try:
+        a = PersonRow(match_key=f"passport:{prefix}-a", full_name="ana gil")
+        b = PersonRow(match_key=f"name:{prefix}-b", full_name="Ana Gil")
+        session.add_all([a, b])
+        session.commit()
+        _add_dupe_group(session, a.id, [(a.id, 1.0, "exact_name"), (b.id, 1.0, "exact_name")])
+        session.commit()
+        gid = a.id
+    finally:
+        session.close()
+
+    refresh_gold(pg_engine)
+    refresh_gold(pg_engine)
+
+    with pg_engine.connect() as conn:
+        n = conn.execute(
+            text("SELECT COUNT(*) FROM gold_duplicate_groups WHERE group_id = :g"), {"g": gid}
+        ).scalar()
+
+    assert n == 1  # one row per group, not duplicated across refreshes

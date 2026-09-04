@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -9,7 +11,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
 
 from hr_etl.models.db_models import (
-    DuplicateGroup,
     GoldPerson,
     MatchCandidate,
     PersonReview,
@@ -245,57 +246,51 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
     ) -> dict:
         """List probable-duplicate GROUPS detected by fuzzy reconciliation.
 
-        Each group bundles several person records that likely refer to the same
-        individual (fuzzy name similarity + optional corroboration). Members are
-        grouped by ``group_id``; each includes the person's name/city/company so the
-        UI can show them side by side.
+        Reads the pre-aggregated ``gold_duplicate_groups`` table (materialized by
+        ``refresh_gold`` once per maintenance cycle): one row per group, members already
+        resolved as JSON. This is a plain indexed ``SELECT ... LIMIT`` (<100ms) instead of
+        the old JOIN-everything-and-bundle-in-Python path (~11s on the prod dataset, and
+        recomputed on every page load / group select). Response shape is unchanged so the
+        frontend needs no change. Returns an empty list if Gold has not been refreshed yet
+        (or the table is absent on this backend) rather than erroring.
         """
         session = session_factory()
         try:
-            # Fetch memberships above the confidence threshold, joined to the person so
-            # the UI has names/city/company without extra round-trips.
-            stmt = (
-                select(
-                    DuplicateGroup.group_id,
-                    DuplicateGroup.person_id,
-                    DuplicateGroup.confidence,
-                    DuplicateGroup.reason,
-                    PersonRow.full_name,
-                    PersonRow.city,
-                    PersonRow.company,
-                )
-                .join(PersonRow, PersonRow.id == DuplicateGroup.person_id)
-                .where(DuplicateGroup.confidence >= min_confidence)
-                .order_by(DuplicateGroup.group_id, DuplicateGroup.person_id)
-            )
-            rows = session.execute(stmt).all()
+            total = session.execute(
+                text(
+                    "SELECT count(*) FROM gold_duplicate_groups "
+                    "WHERE max_confidence >= :min_conf"
+                ),
+                {"min_conf": min_confidence},
+            ).scalar_one()
 
-            # Bundle rows by group_id.
-            groups: dict[int, dict] = {}
-            for r in rows:
-                g = groups.setdefault(
-                    r.group_id,
-                    {"group_id": r.group_id, "confidence": 0.0, "reason": r.reason, "members": []},
-                )
-                g["confidence"] = max(g["confidence"], r.confidence)
-                g["members"].append(
-                    {
-                        "person_id": r.person_id,
-                        "full_name": r.full_name,
-                        "city": r.city,
-                        "company": r.company,
-                    }
-                )
+            rows = session.execute(
+                text(
+                    "SELECT group_id, max_confidence, reason, members "
+                    "FROM gold_duplicate_groups "
+                    "WHERE max_confidence >= :min_conf "
+                    "ORDER BY max_confidence DESC, group_id "
+                    "LIMIT :lim"
+                ),
+                {"min_conf": min_confidence, "lim": limit},
+            ).all()
 
-            # Only groups with >= 2 members are real duplicates; sort by confidence.
-            group_list = [g for g in groups.values() if len(g["members"]) >= 2]
-            group_list.sort(key=lambda g: g["confidence"], reverse=True)
-            limited = group_list[:limit]
-
+            groups = [
+                {
+                    "group_id": r.group_id,
+                    "confidence": r.max_confidence,
+                    "reason": r.reason,
+                    # members is JSONB on Postgres (driver -> list[dict]); on backends that
+                    # return it as a JSON string (e.g. SQLite TEXT) we parse it here so the
+                    # response shape is identical.
+                    "members": r.members if isinstance(r.members, list) else json.loads(r.members),
+                }
+                for r in rows
+            ]
             return {
-                "total_groups": len(group_list),
-                "count": len(limited),
-                "groups": limited,
+                "total_groups": int(total),
+                "count": len(groups),
+                "groups": groups,
             }
         finally:
             session.close()
@@ -304,6 +299,14 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
     def list_gold_persons(
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
+        after_id: int | None = Query(
+            None,
+            ge=0,
+            description="Keyset cursor: return rows with id > after_id (fast deep paging)",
+        ),
+        with_total: bool = Query(
+            False, description="Also compute the exact total (a COUNT; skip it when paging)"
+        ),
         q: str | None = Query(None, description="Free-text search on name/company/email"),
         city: str | None = None,
         company: str | None = None,
@@ -315,6 +318,18 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
         curated, completeness-qualified, name-unique subset of Silver (see
         ``warehouse/gold_layer.py``). Returns an empty page (not an error) if Gold has
         not been refreshed yet or the table doesn't exist on this backend.
+
+        Pagination — two modes:
+        * KEYSET (preferred, pass ``after_id``): returns rows with ``id > after_id``
+          ordered by id. It rides the primary-key index, so page 5000 is as fast as page
+          1 (unlike OFFSET, which scans+discards every earlier row — ~10s deep into a
+          200k-row table). The response carries ``next_cursor`` (the last id on the page)
+          and ``has_more`` so the UI can offer Next without knowing the total.
+        * OFFSET (legacy fallback, pass ``offset``): kept for compatibility.
+
+        ``total`` is only computed when ``with_total=true`` (a full COUNT, expensive at
+        scale). During normal Next/Prev paging the UI does not need it, so it is skipped
+        and returned as None — ``has_more`` is enough to drive the buttons.
         """
         session = session_factory()
         try:
@@ -338,23 +353,35 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
                 )
 
             base = select(GoldPerson)
-            count_stmt = select(func.count()).select_from(GoldPerson)
             for f in filters:
                 base = base.where(f)
-                count_stmt = count_stmt.where(f)
 
-            total = session.execute(count_stmt).scalar_one()
-            rows = (
-                session.execute(base.order_by(GoldPerson.id).limit(limit).offset(offset))
-                .scalars()
-                .all()
-            )
+            # Fetch one extra row to detect whether another page exists without a COUNT.
+            if after_id is not None:
+                base = base.where(GoldPerson.id > after_id)
+                page = base.order_by(GoldPerson.id).limit(limit + 1)
+            else:
+                page = base.order_by(GoldPerson.id).limit(limit + 1).offset(offset)
+
+            rows = session.execute(page).scalars().all()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            next_cursor = rows[-1].id if rows else None
+
+            total: int | None = None
+            if with_total:
+                count_stmt = select(func.count()).select_from(GoldPerson)
+                for f in filters:
+                    count_stmt = count_stmt.where(f)
+                total = session.execute(count_stmt).scalar_one()
 
             return {
                 "total": total,
                 "count": len(rows),
                 "limit": limit,
                 "offset": offset,
+                "next_cursor": next_cursor,
+                "has_more": has_more,
                 "items": [_gold_row_to_dict(r) for r in rows],
             }
         finally:

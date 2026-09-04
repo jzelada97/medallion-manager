@@ -59,20 +59,41 @@ def api_post(path: str, json: dict | None = None) -> dict | None:
         return None
 
 
+@st.cache_data(ttl=30, show_spinner=False)
+def api_get_cached(path: str, timeout: int = 30) -> dict | None:
+    """Cached GET for CONTEXT data that does not change while the user paginates or
+    switches tabs (``/health``, ``/stats``, ``/medallion``). Streamlit reruns the whole
+    script on every widget interaction — a Next click, a selectbox — so without a cache
+    these fixed calls would hit the API again on each rerun. A 30s TTL means they are
+    fetched once and reused for the burst of interactions, then refreshed.
+
+    Kept side-effect free (no ``st.error``) because cached functions should be pure; the
+    caller renders a fallback when it returns None. Only for param-less, stable endpoints
+    — do NOT use it for the paginated list (its params change every page).
+    """
+    try:
+        resp = requests.get(f"{API_URL}{path}", timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Header + health
 # --------------------------------------------------------------------------- #
 st.title("👥 HR Insights")
 st.caption("Consulta de personas consolidadas — HR Pro")
 
-health = api_get("/health")
+health = api_get_cached("/health")
 if health is None:
+    st.error(f"No se pudo conectar con la API en {API_URL}/health.")
     st.stop()
 
 # --------------------------------------------------------------------------- #
 # Stats overview
 # --------------------------------------------------------------------------- #
-stats = api_get("/stats") or {}
+stats = api_get_cached("/stats") or {}
 c1, c2, c3 = st.columns(3)
 c1.metric("Personas totales", stats.get("total_persons", 0))
 c2.metric("Con datos bancarios", stats.get("with_bank", 0))
@@ -123,7 +144,7 @@ with tab_medallion:
         "en registros de persona (Silver), y de ahí se agregan métricas (Gold)."
     )
 
-    med = api_get("/medallion") or {}
+    med = api_get_cached("/medallion") or {}
     bronze = med.get("bronze", {})
     silver = med.get("silver", {})
     gold = med.get("gold", {})
@@ -186,9 +207,13 @@ with tab_persons:
         "Las personas incompletas o con nombre ambiguo se revisan en la pestaña "
         "🔗 Duplicados."
     )
-    # Page number lives in session_state so the Prev/Next buttons can update it.
-    if "persons_page" not in st.session_state:
-        st.session_state.persons_page = 1
+    # Keyset pagination state: a stack of cursors, one per page visited. cursors[i] is the
+    # `after_id` used to fetch page i+1 (cursors[0] is None -> the first page starts from
+    # the beginning). Next pushes the page's next_cursor; Prev pops. This rides the id
+    # index, so deep pages are as fast as the first — unlike OFFSET, which scans+discards
+    # every earlier row (~10s deep into a 200k-row table).
+    if "persons_cursors" not in st.session_state:
+        st.session_state.persons_cursors = [None]
 
     # --- Search bar (prominent) + advanced filters in an expander ---
     search_col, size_col = st.columns([4, 1])
@@ -212,18 +237,23 @@ with tab_persons:
         company = fc2.text_input("Empresa")
         job = fc3.text_input("Puesto")
 
-    # Any change in the search/filters resets to page 1 so results make sense.
+    # Any change in the search/filters resets pagination to the first page.
     filter_signature = (q, city, company, job, page_size)
     if st.session_state.get("persons_filter_sig") != filter_signature:
         st.session_state.persons_filter_sig = filter_signature
-        st.session_state.persons_page = 1
+        st.session_state.persons_cursors = [None]
 
-    page = st.session_state.persons_page
+    cursors = st.session_state.persons_cursors
+    page_number = len(cursors)  # 1-based, for display only
+    after_id = cursors[-1]
 
-    params: dict[str, object] = {
-        "limit": int(page_size),
-        "offset": (int(page) - 1) * int(page_size),
-    }
+    params: dict[str, object] = {"limit": int(page_size)}
+    if after_id is not None:
+        params["after_id"] = int(after_id)
+    # Ask for the exact total only on the first page (a COUNT). Deeper pages rely on
+    # has_more, so paging never pays for the COUNT again.
+    if page_number == 1:
+        params["with_total"] = True
     if q:
         params["q"] = q
     if city:
@@ -233,18 +263,24 @@ with tab_persons:
     if job:
         params["job"] = job
 
-    data = api_get("/gold/persons", params) or {"total": 0, "count": 0, "items": []}
-    total = data.get("total", 0)
+    data = api_get("/gold/persons", params) or {
+        "total": 0,
+        "count": 0,
+        "items": [],
+        "has_more": False,
+        "next_cursor": None,
+    }
     items = data.get("items", [])
-    total_pages = max(1, (int(total) + int(page_size) - 1) // int(page_size))
-
-    # Clamp page if filters shrank the result set below the current page.
-    if page > total_pages:
-        st.session_state.persons_page = total_pages
-        page = total_pages
+    has_more = data.get("has_more", False)
+    next_cursor = data.get("next_cursor")
+    # total is only present on page 1; cache it so later pages can still show it.
+    if data.get("total") is not None:
+        st.session_state.persons_total = data["total"]
+    total = st.session_state.get("persons_total")
 
     st.subheader("Personas")
-    st.caption(f"{total} resultado(s) · {int(page_size)} por página")
+    total_txt = f"{total} resultado(s) · " if total is not None else ""
+    st.caption(f"{total_txt}{int(page_size)} por página")
 
     if items:
         df = pd.DataFrame(items)
@@ -267,18 +303,18 @@ with tab_persons:
         # --- Pagination controls (Prev / page indicator / Next) ---
         prev_col, ind_col, next_col = st.columns([1, 2, 1])
         with prev_col:
-            if st.button("◀ Anterior", disabled=(page <= 1), use_container_width=True):
-                st.session_state.persons_page = max(1, page - 1)
+            if st.button("◀ Anterior", disabled=(page_number <= 1), use_container_width=True):
+                st.session_state.persons_cursors = cursors[:-1] or [None]
                 st.rerun()
         with ind_col:
             st.markdown(
                 f"<div style='text-align:center;padding-top:6px'>"
-                f"Página <b>{int(page)}</b> de <b>{total_pages}</b></div>",
+                f"Página <b>{page_number}</b></div>",
                 unsafe_allow_html=True,
             )
         with next_col:
-            if st.button("Siguiente ▶", disabled=(page >= total_pages), use_container_width=True):
-                st.session_state.persons_page = min(total_pages, page + 1)
+            if st.button("Siguiente ▶", disabled=(not has_more), use_container_width=True):
+                st.session_state.persons_cursors = cursors + [next_cursor]
                 st.rerun()
 
         # --- Detail view ---

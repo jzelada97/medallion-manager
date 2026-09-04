@@ -171,6 +171,15 @@ def _create_sqlite_gold_tables(session_factory) -> None:
                 "person_count INTEGER)"
             )
         )
+        # members is JSONB in production; TEXT here (SQLite has no JSONB). The endpoint
+        # parses a JSON string back to a list, so the response shape is identical.
+        session.execute(
+            text(
+                "CREATE TABLE gold_duplicate_groups (group_id INTEGER PRIMARY KEY, "
+                "member_count INTEGER, max_confidence FLOAT, reason VARCHAR(255), "
+                "members TEXT)"
+            )
+        )
         session.commit()
     finally:
         session.close()
@@ -206,7 +215,8 @@ def test_gold_persons_endpoint_lists_only_gold(sqlite_session_factory):
         session.close()
 
     client = _client(sqlite_session_factory)
-    resp = client.get("/gold/persons")
+    # with_total=true asks for the exact COUNT (skipped by default during keyset paging).
+    resp = client.get("/gold/persons", params={"with_total": True})
     assert resp.status_code == 200
     body = resp.json()
     assert body["total"] == 1
@@ -233,18 +243,35 @@ def test_gold_persons_endpoint_filters_and_pagination(sqlite_session_factory):
     client = _client(sqlite_session_factory)
 
     assert client.get("/gold/persons", params={"city": "madrid"}).json()["count"] == 2
-    assert client.get("/gold/persons", params={"q": "beatriz"}).json()["total"] == 1
+    assert (
+        client.get("/gold/persons", params={"q": "beatriz", "with_total": True}).json()["total"]
+        == 1
+    )
 
-    page = client.get("/gold/persons", params={"limit": 2, "offset": 0}).json()
+    # First page (with total) + keyset cursor for the next page.
+    page = client.get("/gold/persons", params={"limit": 2, "with_total": True}).json()
     assert page["total"] == 3
     assert page["count"] == 2
+    assert page["has_more"] is True
+    # Next page via the cursor returns the remaining row (id > next_cursor).
+    page2 = client.get("/gold/persons", params={"limit": 2, "after_id": page["next_cursor"]}).json()
+    assert page2["count"] == 1
+    assert page2["has_more"] is False
 
 
 def test_gold_persons_endpoint_empty_when_not_refreshed(sqlite_session_factory):
     """No error if gold_persons exists but is empty (Gold not refreshed yet)."""
     client = _client(sqlite_session_factory)
-    body = client.get("/gold/persons").json()
-    assert body == {"total": 0, "count": 0, "limit": 50, "offset": 0, "items": []}
+    body = client.get("/gold/persons", params={"with_total": True}).json()
+    assert body == {
+        "total": 0,
+        "count": 0,
+        "limit": 50,
+        "offset": 0,
+        "next_cursor": None,
+        "has_more": False,
+        "items": [],
+    }
 
 
 def test_gold_stats_endpoint(sqlite_session_factory):
@@ -303,47 +330,30 @@ _FORBIDDEN_GROUP_MEMBER_FIELDS = {"passport", "iban", "salary", "email", "phone"
 
 
 def _seed_duplicate_group(session_factory) -> None:
-    """Seed two persons (with PII) + a duplicate group linking them."""
-    from hr_etl.models.db_models import DuplicateGroup
-    from hr_etl.models.person import Person
+    """Seed a materialized gold_duplicate_groups row whose members carry ONLY the four
+    display fields (person_id/full_name/city/company). The endpoint reads this table
+    directly; the materialization in gold_layer.py is what guarantees the member payload
+    never includes PII, and test_gold_layer.py covers that build against Postgres. Here we
+    verify the endpoint itself does not leak extra fields."""
+    import json as _json
 
-    repo = PersonRepository(session_factory)
-    repo.upsert(
-        Person(
-            match_key="g1",
-            full_name="jean leclerc",
-            city="paris",
-            company="acme",
-            passport="P-A",
-            iban="ES-A",
-            email="a@x.com",
-            phone="600",
-            ipv4="1.1.1.1",
-        )
-    )
-    repo.upsert(
-        Person(
-            match_key="g2",
-            full_name="jean leclercq",
-            city="paris",
-            company="acme",
-            passport="P-B",
-            iban="ES-B",
-            email="b@x.com",
-            phone="601",
-            ipv4="2.2.2.2",
-        )
-    )
+    from sqlalchemy import text
+
+    _create_sqlite_gold_tables(session_factory)
+    members = [
+        {"person_id": 1, "full_name": "jean leclerc", "city": "paris", "company": "acme"},
+        {"person_id": 2, "full_name": "jean leclercq", "city": "paris", "company": "acme"},
+    ]
     session = session_factory()
     try:
-        from hr_etl.models.db_models import PersonRow
-
-        ids = [r.id for r in session.query(PersonRow).order_by(PersonRow.id).all()]
-        gid = min(ids)
-        for pid in ids:
-            session.add(
-                DuplicateGroup(group_id=gid, person_id=pid, confidence=0.92, reason="fuzzy_name")
-            )
+        session.execute(
+            text(
+                "INSERT INTO gold_duplicate_groups "
+                "(group_id, member_count, max_confidence, reason, members) "
+                "VALUES (1, 2, 0.92, 'fuzzy_name', :members)"
+            ),
+            {"members": _json.dumps(members)},
+        )
         session.commit()
     finally:
         session.close()

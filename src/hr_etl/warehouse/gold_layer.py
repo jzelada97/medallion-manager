@@ -77,6 +77,24 @@ CREATE TABLE IF NOT EXISTS gold_completeness (
     fields_filled INTEGER PRIMARY KEY,
     person_count INTEGER NOT NULL DEFAULT 0
 );
+
+-- Gold: pre-aggregated duplicate groups for the review pane (one row per GROUP).
+-- The /groups endpoint used to JOIN duplicate_groups to persons, pull every membership
+-- above the confidence threshold to Python, bundle by group_id and only then slice —
+-- ~11s on the production dataset, recomputed on every page load and every group select.
+-- Materializing it here (once per maintenance cycle) turns /groups into a plain indexed
+-- SELECT ... LIMIT (<100ms). members holds the resolved member list as JSON so the UI
+-- needs no per-member round-trips either.
+CREATE TABLE IF NOT EXISTS gold_duplicate_groups (
+    group_id INTEGER PRIMARY KEY,
+    member_count INTEGER NOT NULL DEFAULT 0,
+    max_confidence FLOAT NOT NULL DEFAULT 0.0,
+    reason VARCHAR(255) NOT NULL DEFAULT '',
+    members JSONB NOT NULL DEFAULT '[]',
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS ix_gold_dupe_groups_conf
+    ON gold_duplicate_groups (max_confidence DESC);
 """
 
 # The 8 data fields tracked for completeness (mirrors the model docstring and the
@@ -229,6 +247,45 @@ ORDER BY 1;
 """
 
 
+# Materialize the duplicate-review groups. One row per group_id, with:
+#   * member_count / max_confidence — for filtering (min_confidence) and ordering.
+#   * reason — a representative signal (the strongest: containment > fuzzy > exact via MIN
+#     on a rank, but a simple MAX(reason) text is enough for display; we take the reason of
+#     the highest-confidence member deterministically).
+#   * members — the resolved member list as a JSON array, so /groups serves it verbatim
+#     with zero per-member round-trips.
+# Only groups that still have >= 2 members AFTER excluding person_reviews-resolved rows are
+# kept (a group whose ambiguity a human already settled is not a pending duplicate). The
+# person_reviews exclusion mirrors reconcile's own filter, so this stays correct even if
+# refresh_gold runs without a fresh reconcile.
+_REFRESH_DUPLICATE_GROUPS = """
+DELETE FROM gold_duplicate_groups;
+INSERT INTO gold_duplicate_groups (group_id, member_count, max_confidence, reason, members)
+SELECT
+    dg.group_id,
+    COUNT(*)                       AS member_count,
+    MAX(dg.confidence)             AS max_confidence,
+    (array_agg(dg.reason ORDER BY dg.confidence DESC))[1] AS reason,
+    json_agg(
+        json_build_object(
+            'person_id', dg.person_id,
+            'full_name', p.full_name,
+            'city', p.city,
+            'company', p.company
+        ) ORDER BY dg.person_id
+    )                              AS members
+FROM duplicate_groups dg
+JOIN persons p ON p.id = dg.person_id
+WHERE NOT EXISTS (
+    SELECT 1 FROM person_reviews r
+    WHERE r.match_key = p.match_key
+      AND r.status IN ('approved', 'distinct', 'merged')
+)
+GROUP BY dg.group_id
+HAVING COUNT(*) >= 2;
+"""
+
+
 def init_gold_schema(engine: Engine) -> None:
     """Create Gold layer tables if they don't exist.
 
@@ -261,6 +318,9 @@ def refresh_gold(engine: Engine) -> int:
     stays self-sufficient outside the full init_schema path.
     """
     with engine.begin() as conn:
+        # Ensure the aggregate gold_* targets exist (normally created by init_gold_schema;
+        # keeps refresh_gold self-sufficient when called directly, e.g. in tests).
+        conn.execute(text(_CREATE_GOLD_TABLES))
         conn.execute(text(_ENSURE_REVIEWS_TABLE_SQL))
         conn.execute(text(_BACKFILL_NORM_SQL))
         conn.execute(text(_REBUILD_GOLD_PERSONS))
@@ -268,6 +328,7 @@ def refresh_gold(engine: Engine) -> int:
         conn.execute(text(_REFRESH_TOP_CITIES))
         conn.execute(text(_REFRESH_TOP_COMPANIES))
         conn.execute(text(_REFRESH_COMPLETENESS))
+        conn.execute(text(_REFRESH_DUPLICATE_GROUPS))
         gold_persons = conn.execute(text("SELECT count(*) FROM gold_persons")).scalar_one()
     logger.info("gold layer refreshed: gold_persons=%d", int(gold_persons))
     try:

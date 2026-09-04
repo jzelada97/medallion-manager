@@ -8,7 +8,9 @@
 #   1. Pulls the latest `main` (fast-forward only, so a dirty tree fails loudly).
 #   2. Rebuilds + restarts the query/ingest stack (app, api, frontend get rebuilt;
 #      datastores/monitoring reuse their images).
-#   3. Prunes dangling images so the boot volume doesn't fill up over time.
+#   3. Refreshes the Gold layer (materialized gold_* tables the API/frontend read) so a
+#      fresh schema or Gold-logic change shows up immediately, not 30 min later.
+#   4. Prunes dangling images so the boot volume doesn't fill up over time.
 #
 # Airflow is intentionally NOT restarted here: its DAGs are bind-mounted, so a plain
 # `git pull` already refreshes them. Only re-run docker-compose.airflow.yml by hand if
@@ -37,7 +39,17 @@ if ! docker ps >/dev/null 2>&1; then DOCKER="sudo docker"; fi
 
 $DOCKER compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
 
-echo ">> [3/3] Pruning dangling images ..."
+echo ">> [3/4] Refreshing the Gold layer (gold_persons + gold_duplicate_groups + stats) ..."
+# The API/frontend read only the materialized gold_* tables. Refresh them once on every
+# deploy so a fresh schema (or a code change to the Gold/duplicate-group logic) is
+# reflected immediately, instead of waiting up to 30 min for the maintenance DAG. The
+# maintenance DAG still refreshes them periodically afterwards. Idempotent (DELETE+INSERT);
+# never fails the deploy (the periodic DAG would recover on the next cycle).
+$DOCKER compose -f docker-compose.yml -f docker-compose.prod.yml exec -T app \
+  python -m hr_etl.warehouse.gold_layer || \
+  echo "   WARNING: gold refresh failed; the maintenance DAG will retry on its next run." >&2
+
+echo ">> [4/4] Pruning dangling images ..."
 $DOCKER image prune -f >/dev/null 2>&1 || true
 
 echo ">> Deploy done. Current services:"
