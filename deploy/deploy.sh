@@ -43,10 +43,24 @@ echo ">> [3/4] Refreshing the Gold layer (gold_persons + gold_duplicate_groups +
 # The API/frontend read only the materialized gold_* tables. Refresh them once on every
 # deploy so a fresh schema (or a code change to the Gold/duplicate-group logic) is
 # reflected immediately, instead of waiting up to 30 min for the maintenance DAG. The
-# maintenance DAG still refreshes them periodically afterwards. Idempotent (DELETE+INSERT);
-# never fails the deploy (the periodic DAG would recover on the next cycle).
-$DOCKER compose -f docker-compose.yml -f docker-compose.prod.yml exec -T app \
-  python -m hr_etl.warehouse.gold_layer || \
+# maintenance DAG still refreshes them periodically afterwards. Idempotent (DELETE+INSERT).
+#
+# Use a ONE-OFF `run --rm` container (not `exec` on the freshly-recreated `app`): right
+# after `up -d --build`, `app` may still be initializing, so `exec` can hit it in a
+# transient state and fail silently (which is exactly what left gold_duplicate_groups
+# empty on the first deploy of this change). `run --rm` spins a dedicated container that
+# waits for its depends_on (postgres healthy) and exits when done. A short readiness wait
+# on Postgres is added as belt-and-braces. Never fails the deploy — the periodic
+# maintenance DAG recovers on its next cycle if this step errors.
+COMPOSE="$DOCKER compose -f docker-compose.yml -f docker-compose.prod.yml"
+echo "   waiting for postgres to accept connections ..."
+for i in $(seq 1 30); do
+  if $COMPOSE exec -T postgres pg_isready -U "${POSTGRES_USER:-hr_user}" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 2
+done
+$COMPOSE run --rm --no-deps app python -m hr_etl.warehouse.gold_layer || \
   echo "   WARNING: gold refresh failed; the maintenance DAG will retry on its next run." >&2
 
 echo ">> [4/4] Pruning dangling images ..."
