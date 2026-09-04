@@ -111,23 +111,43 @@ class PersonRepository:
         Returns the number of rows sent. The whole batch commits atomically:
         either all rows are persisted or none (safe to reprocess from the lake).
         """
-        rows: list[dict[str, object]] = []
+        # Collapse duplicates by match_key WITHIN the batch. PostgreSQL forbids an
+        # ON CONFLICT DO UPDATE from touching the same target row twice in a single
+        # statement (CardinalityViolation), which happens during bulk reprocessing
+        # when two consolidations resolve to the same key in one batch. We merge
+        # them here with the same gap-fill semantics as the on-conflict COALESCE:
+        # the first non-empty value for each field wins.
+        merged: dict[str, dict[str, object]] = {}
         for person in persons:
             if not person.match_key:
                 raise ValueError("Person.match_key is required for upsert")
             non_empty = _non_empty_values(person)
-            # Every row must carry the SAME set of keys for a multi-row INSERT,
-            # so we fill absent fields with None (missing -> NULL). COALESCE on
-            # conflict keeps existing values, so NULLs never overwrite good data.
-            payload = {field: non_empty.get(field) for field in _FIELDS}
-            payload["match_key"] = person.match_key
+            existing = merged.get(person.match_key)
+            if existing is None:
+                # Every row must carry the SAME set of keys for a multi-row INSERT,
+                # so we fill absent fields with None (missing -> NULL). COALESCE on
+                # conflict keeps existing values, so NULLs never overwrite good data.
+                payload = {field: non_empty.get(field) for field in _FIELDS}
+                payload["match_key"] = person.match_key
+                merged[person.match_key] = payload
+            else:
+                # Fill only the gaps left by earlier fragments of the same key.
+                for field in _FIELDS:
+                    if existing.get(field) in (None, "") and non_empty.get(field) not in (
+                        None,
+                        "",
+                    ):
+                        existing[field] = non_empty[field]
+
+        if not merged:
+            return 0
+
+        rows: list[dict[str, object]] = []
+        for payload in merged.values():
             # Derived norm_name for the INSERT path (new rows). On conflict it is
             # recomputed from the surviving full_name below.
-            payload["norm_name"] = compute_norm_name(person.full_name)
+            payload["norm_name"] = compute_norm_name(payload.get("full_name"))
             rows.append(payload)
-
-        if not rows:
-            return 0
 
         session: Session = self._session_factory()
         try:
