@@ -24,10 +24,16 @@ st.set_page_config(page_title="HR Insights", page_icon="👥", layout="wide")
 # --------------------------------------------------------------------------- #
 # API helpers
 # --------------------------------------------------------------------------- #
-def api_get(path: str, params: dict | None = None) -> dict | None:
-    """GET a JSON resource from the API, showing a friendly error on failure."""
+def api_get(path: str, params: dict | None = None, timeout: int = 30) -> dict | None:
+    """GET a JSON resource from the API, showing a friendly error on failure.
+
+    ``timeout`` defaults to 30s: some endpoints (notably ``/groups``, which bundles the
+    duplicate-review groups) run heavy aggregations over the full warehouse and can take
+    ~10-15s on the production dataset. A 10s cap timed those out, so the pane fell back to
+    its empty state even though the API was healthy. Pass a smaller value for light calls.
+    """
     try:
-        resp = requests.get(f"{API_URL}{path}", params=params, timeout=10)
+        resp = requests.get(f"{API_URL}{path}", params=params, timeout=timeout)
         resp.raise_for_status()
         return resp.json()
     except requests.RequestException as exc:
