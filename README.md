@@ -446,6 +446,39 @@ Metricas Prometheus añadidas (solo numericas, sin PII): `hr_etl_consolidation_m
 `hr_etl_reconcile_duration_seconds`, `hr_etl_reconcile_groups`, `hr_etl_reconcile_memberships`,
 `hr_etl_gold_persons`.
 
+#### Reprocesar / reset desde Bronze
+
+Bronze (MongoDB) es la unica fuente de verdad inmutable: guarda cada mensaje crudo tal como
+llego. Silver y Gold son capas **derivadas** y se pueden reconstruir en cualquier momento
+desde Bronze, sin perder informacion. Esto sirve para reset limpios o para reprocesar tras
+cambiar la logica de matching.
+
+`reprocess.py` relee todos los documentos de Mongo y los pasa por el mismo pipeline que el
+consumer en streaming (detectar tipo → key → buffer Redis → consolidar → upsert). Es
+idempotente (upsert por `match_key`), asi que relanzarlo no duplica.
+
+```
+# 1. (Opcional) vaciar las capas derivadas para empezar de cero. Bronze/Mongo NO se toca.
+#    TRUNCATE de: persons, duplicate_groups, match_candidates, person_reviews,
+#    gold_persons, gold_stats, gold_top_cities, gold_top_companies,
+#    gold_completeness, gold_duplicate_groups (RESTART IDENTITY CASCADE)
+
+# 2. Reconstruir Silver desde Bronze (idempotente; en produccion usar nohup/tmux)
+python -m hr_etl.reprocess
+
+# 3. Reconstruir capas derivadas EN ORDEN (dependencia de datos)
+python -m hr_etl.processing.consolidate_merge
+python -m hr_etl.processing.reconcile
+python -m hr_etl.warehouse.gold_layer
+```
+
+Nota de rendimiento: el upsert de `reprocess` va por lotes multi-fila. Como un mismo lote
+puede contener dos consolidaciones que resuelven al mismo `match_key`, el batch se
+**deduplica por `match_key` antes de insertar** (evita el error de PostgreSQL
+`ON CONFLICT DO UPDATE command cannot affect row a second time`), manteniendo la semantica
+idempotente. Validado sobre ~6,9M de documentos con 0 fallos; la reconciliacion sobre ~2M
+personas resultantes corre en ~70 s.
+
 #### Ideas RECHAZADAS y por que (DEC-9)
 
 - **Exigir corroboracion por campo en la reconciliacion** → las personas partidas reales
@@ -758,6 +791,13 @@ completo. Las principales:
 
 4. **Fragmentos Net**: El fragmento Net (address + IPv4) raramente se une a otros porque depende
    de un match exacto de address, que pocas veces coincide.
+
+5. **Accion "Distinta" en revision de duplicados**: hoy marca la persona como registro
+   distinto en `person_reviews` y la saca de la cola. Falta el comportamiento completo de
+   *split/unmerge*: cuando la consolidacion unio por error fragmentos de personas diferentes
+   (p. ej. un Personal correcto con un Location/Professional que coincidio solo por nombre),
+   "Distinta" deberia deshacer esa union y separar el registro en sus fragmentos originales.
+   Pendiente de implementar.
 
 ### Ya implementado (nivel Experto)
 
