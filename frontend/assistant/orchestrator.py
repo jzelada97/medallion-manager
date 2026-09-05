@@ -39,7 +39,7 @@ def is_available() -> bool:
 def chat(user_message: str, history: list[dict]) -> str:
     """Run one turn: user_message + history → assistant reply."""
     client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-    model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
     for msg in history:

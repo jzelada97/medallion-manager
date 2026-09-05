@@ -11,6 +11,7 @@ to the passport-based key, achieving the cross-join.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from hr_etl.cache.redis_buffer import RedisBuffer
@@ -25,6 +26,7 @@ from hr_etl.metrics.prometheus import (
     PERSONS_PERSISTED,
     PROCESSING_SECONDS,
 )
+from hr_etl.models.db_models import FragmentLog
 from hr_etl.models.raw import FragmentType
 from hr_etl.processing.consolidator import consolidate
 from hr_etl.processing.detector import detect_type
@@ -44,11 +46,13 @@ class Pipeline:
         buffer: RedisBuffer,
         repo: PersonRepository,
         min_fragments: int = 2,
+        session_factory=None,
     ) -> None:
         self._lake = lake
         self._buffer = buffer
         self._repo = repo
         self._min_fragments = min_fragments
+        self._session_factory = session_factory
 
     def _register_cross_link(self, message: dict[str, Any], ftype: FragmentType, key: str) -> None:
         """If a Personal fragment has passport + name, register the name as alias."""
@@ -110,8 +114,38 @@ class Pipeline:
             with PERSIST_SECONDS.time():
                 person_id = self._repo.upsert(person)
             PERSONS_PERSISTED.inc()
+
+            # Audit trail: log each fragment so SPLIT can recover them later
+            if self._session_factory is not None:
+                self._log_fragments(person_id, key, fragments)
+
             return person_id
         except Exception:  # never let one bad message kill the pipeline
             MESSAGES_FAILED.inc()
             logger.exception("error processing message")
             return None
+
+    def _log_fragments(
+        self,
+        person_id: int,
+        match_key: str,
+        fragments: list[tuple[dict[str, Any], FragmentType]],
+    ) -> None:
+        """Persist a FragmentLog row for each fragment that built this person."""
+        session = self._session_factory()
+        try:
+            for msg, ftype in fragments:
+                session.add(
+                    FragmentLog(
+                        person_id=person_id,
+                        match_key=match_key,
+                        fragment_type=ftype.value,
+                        payload=json.dumps(msg, ensure_ascii=False),
+                    )
+                )
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.warning("fragment_log write failed for person_id=%s", person_id)
+        finally:
+            session.close()

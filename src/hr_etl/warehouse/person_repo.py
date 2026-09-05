@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from hr_etl.logging_conf import get_logger
 from hr_etl.models.db_models import PersonRow
 from hr_etl.models.person import Person
+from hr_etl.processing.normalizer import normalize_text, strip_titles
 
 logger = get_logger(__name__)
 
@@ -33,6 +34,16 @@ _FIELDS = (
     "salary",
     "ipv4",
 )
+
+
+def _compute_norm_name(person: Person) -> str | None:
+    """Normalized name for duplicate detection (same logic as matcher)."""
+    raw = person.full_name or (
+        f"{person.name or ''} {person.lastname or ''}".strip() or None
+    )
+    if not raw:
+        return None
+    return strip_titles(normalize_text(raw)) or None
 
 
 def _non_empty_values(person: Person) -> dict[str, object]:
@@ -69,6 +80,7 @@ class PersonRepository:
                 row = PersonRow(match_key=person.match_key)
                 for field in _FIELDS:
                     setattr(row, field, getattr(person, field))
+                row.norm_name = _compute_norm_name(person)
                 session.add(row)
             else:
                 for field in _FIELDS:
@@ -76,6 +88,8 @@ class PersonRepository:
                     current = getattr(row, field)
                     if new_value not in (None, "") and current in (None, ""):
                         setattr(row, field, new_value)
+                if row.norm_name is None:
+                    row.norm_name = _compute_norm_name(person)
 
             session.commit()
             logger.debug("upserted person match_key=%s id=%s", person.match_key, row.id)
@@ -115,6 +129,7 @@ class PersonRepository:
             # conflict keeps existing values, so NULLs never overwrite good data.
             payload = {field: non_empty.get(field) for field in _FIELDS}
             payload["match_key"] = person.match_key
+            payload["norm_name"] = _compute_norm_name(person)
             rows.append(payload)
 
         if not rows:
@@ -131,6 +146,9 @@ class PersonRepository:
                 field: func.coalesce(PersonRow.__table__.c[field], stmt.excluded[field])
                 for field in _FIELDS
             }
+            update_cols["norm_name"] = func.coalesce(
+                PersonRow.__table__.c["norm_name"], stmt.excluded["norm_name"]
+            )
             stmt = stmt.on_conflict_do_update(
                 index_elements=["match_key"],
                 set_=update_cols,
