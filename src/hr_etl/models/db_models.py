@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, String, func
+from sqlalchemy import DateTime, Float, Integer, String, Text, func
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -47,6 +47,23 @@ class PersonRow(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class FragmentLog(Base):
+    """Audit trail: one row per fragment that contributed to a consolidated person.
+
+    Stored at consolidation time so that a SPLIT/UNMERGE can recover the original
+    fragments without querying MongoDB (which may be unavailable or slow).
+    """
+
+    __tablename__ = "fragment_log"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    person_id: Mapped[int] = mapped_column(Integer, index=True)
+    match_key: Mapped[str] = mapped_column(String(255), index=True)
+    fragment_type: Mapped[str] = mapped_column(String(32))
+    payload: Mapped[str] = mapped_column(Text)  # JSON-serialized raw message
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
 class MatchCandidate(Base):

@@ -126,7 +126,12 @@ st.divider()
 # --------------------------------------------------------------------------- #
 # Tabs: Personas | Duplicados
 # --------------------------------------------------------------------------- #
-tab_medallion, tab_persons, tab_dupes = st.tabs(["🏅 Arquitectura", "👤 Personas", "🔗 Duplicados"])
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).resolve().parent))
+from assistant.bot import render_assistant_tab
+
+tab_medallion, tab_persons, tab_dupes, tab_assistant = st.tabs(["🏅 Arquitectura", "👤 Personas", "🔗 Duplicados", "🤖 Asistente Virtual"])
 
 
 # --------------------------------------------------------------------------- #
@@ -516,3 +521,10 @@ with tab_dupes:
                     st.caption("Selecciona exactamente 2 personas para consolidar.")
                 elif cap_reached:
                     st.caption("Máximo 2 seleccionadas. Desmarca una para elegir otra.")
+
+
+# --------------------------------------------------------------------------- #
+# Tab 3: Asistente Virtual
+# --------------------------------------------------------------------------- #
+with tab_assistant:
+    render_assistant_tab()
