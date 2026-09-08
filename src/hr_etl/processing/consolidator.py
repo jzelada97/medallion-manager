@@ -10,6 +10,13 @@ from hr_etl.processing.matcher import build_full_name, match_key
 from hr_etl.processing.normalizer import clean_salary, normalize_message
 
 
+def _scalar(value: Any) -> Any:
+    """If value is a list, return the first element; otherwise return as-is."""
+    if isinstance(value, list):
+        return value[0] if value else None
+    return value
+
+
 def fragment_to_person(message: dict[str, Any], ftype: FragmentType, key: str) -> Person:
     """Map a single normalized fragment into a partial Person."""
     n = normalize_message(message)
@@ -17,39 +24,39 @@ def fragment_to_person(message: dict[str, Any], ftype: FragmentType, key: str) -
 
     if ftype == FragmentType.PERSONAL:
         data.update(
-            name=n.get("name"),
-            lastname=n.get("lastname"),
-            sex=n.get("sex"),
-            phone=n.get("telfnumber"),
-            passport=n.get("passport"),
-            email=n.get("email"),
+            name=_scalar(n.get("name")),
+            lastname=_scalar(n.get("lastname")),
+            sex=_scalar(n.get("sex")),
+            phone=_scalar(n.get("telfnumber")),
+            passport=_scalar(n.get("passport")),
+            email=_scalar(n.get("email")),
             full_name=build_full_name(n) or None,
         )
     elif ftype == FragmentType.LOCATION:
         data.update(
-            full_name=n.get("fullname"),
-            city=n.get("city"),
-            address=n.get("address"),
+            full_name=_scalar(n.get("fullname")),
+            city=_scalar(n.get("city")),
+            address=_scalar(n.get("address")),
         )
     elif ftype == FragmentType.PROFESSIONAL:
         data.update(
-            full_name=n.get("fullname"),
-            company=n.get("company"),
-            company_address=n.get("companyaddress"),
-            company_phone=n.get("companytelfnumber"),
-            company_email=n.get("companyemail"),
-            job=n.get("job"),
+            full_name=_scalar(n.get("fullname")),
+            company=_scalar(n.get("company")),
+            company_address=_scalar(n.get("companyaddress")),
+            company_phone=_scalar(n.get("companytelfnumber")),
+            company_email=_scalar(n.get("companyemail")),
+            job=_scalar(n.get("job")),
         )
     elif ftype == FragmentType.BANK:
         data.update(
-            passport=n.get("passport"),
-            iban=n.get("iban"),
-            salary=clean_salary(n.get("salary")),
+            passport=_scalar(n.get("passport")),
+            iban=_scalar(n.get("iban")),
+            salary=clean_salary(_scalar(n.get("salary"))),
         )
     elif ftype == FragmentType.NET:
         data.update(
-            address=n.get("address"),
-            ipv4=n.get("ipv4"),
+            address=_scalar(n.get("address")),
+            ipv4=_scalar(n.get("ipv4")),
         )
 
     # Drop empty values so merge() does not overwrite good data with blanks.

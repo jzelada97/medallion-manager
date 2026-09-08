@@ -13,16 +13,23 @@ from __future__ import annotations
 from typing import Any
 
 from hr_etl.models.raw import FragmentType
-from hr_etl.processing.normalizer import normalize_message, normalize_text
+from hr_etl.processing.normalizer import normalize_message, normalize_text, strip_titles
 
 
 def build_full_name(norm_msg: dict[str, Any]) -> str:
-    """Build a normalized full name from either fullname or name+lastname."""
+    """Build a normalized full name from either fullname or name+lastname.
+
+    Strips honorific titles (Mr, Dr, Ing., etc.) so that Personal fragments
+    (which lack titles) can match Location/Professional fragments (which may
+    include them).
+    """
     if norm_msg.get("fullname"):
-        return normalize_text(norm_msg["fullname"])
+        raw = normalize_text(norm_msg["fullname"])
+        return strip_titles(raw)
     name = normalize_text(norm_msg.get("name"))
     lastname = normalize_text(norm_msg.get("lastname"))
-    return normalize_text(f"{name} {lastname}")
+    raw = normalize_text(f"{name} {lastname}")
+    return strip_titles(raw)
 
 
 def match_key(message: dict[str, Any], ftype: FragmentType) -> str:

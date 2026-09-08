@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     consolidation_min_fragments: int = 2
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    max_records: int | None = None  # None = infinito; set a un número para modo demo/prueba
 
     @property
     def postgres_dsn(self) -> str:

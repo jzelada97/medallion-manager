@@ -2,20 +2,48 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from collections.abc import Iterable
+
+from sqlalchemy import func, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from hr_etl.logging_conf import get_logger
 from hr_etl.models.db_models import PersonRow
 from hr_etl.models.person import Person
+from hr_etl.processing.normalizer import compute_norm_name
+from hr_etl.processing.sql_norm import norm_sql
 
 logger = get_logger(__name__)
 
 _FIELDS = (
-    "passport", "full_name", "name", "lastname", "sex", "phone", "email",
-    "city", "address", "company", "company_address", "company_phone",
-    "company_email", "job", "iban", "salary", "ipv4",
+    "passport",
+    "full_name",
+    "name",
+    "lastname",
+    "sex",
+    "phone",
+    "email",
+    "city",
+    "address",
+    "company",
+    "company_address",
+    "company_phone",
+    "company_email",
+    "job",
+    "iban",
+    "salary",
+    "ipv4",
 )
+
+
+def _non_empty_values(person: Person) -> dict[str, object]:
+    """Return the person fields that carry a real (non-empty) value."""
+    return {
+        field: getattr(person, field)
+        for field in _FIELDS
+        if getattr(person, field) not in (None, "")
+    }
 
 
 class PersonRepository:
@@ -51,9 +79,102 @@ class PersonRepository:
                     if new_value not in (None, "") and current in (None, ""):
                         setattr(row, field, new_value)
 
+            # norm_name is a DERIVED column: keep it in sync with the resulting
+            # full_name. Does not touch match_key or the merge/fill logic above.
+            row.norm_name = compute_norm_name(row.full_name)
+
             session.commit()
             logger.debug("upserted person match_key=%s id=%s", person.match_key, row.id)
             return row.id
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def upsert_native(self, person: Person) -> None:
+        """Idempotent upsert using PostgreSQL ``INSERT ... ON CONFLICT``.
+
+        Performs the whole upsert in a single atomic statement (no SELECT + write
+        race window). Only fills columns that are currently NULL, preserving
+        existing non-empty data via COALESCE(existing, new).
+
+        Requires PostgreSQL. For SQLite/tests use :meth:`upsert`.
+        """
+        if not person.match_key:
+            raise ValueError("Person.match_key is required for upsert")
+        self.upsert_many_native([person])
+
+    def upsert_many_native(self, persons: Iterable[Person]) -> int:
+        """Batch idempotent upsert on PostgreSQL in a single transaction.
+
+        Returns the number of rows sent. The whole batch commits atomically:
+        either all rows are persisted or none (safe to reprocess from the lake).
+        """
+        # Collapse duplicates by match_key WITHIN the batch. PostgreSQL forbids an
+        # ON CONFLICT DO UPDATE from touching the same target row twice in a single
+        # statement (CardinalityViolation), which happens during bulk reprocessing
+        # when two consolidations resolve to the same key in one batch. We merge
+        # them here with the same gap-fill semantics as the on-conflict COALESCE:
+        # the first non-empty value for each field wins.
+        merged: dict[str, dict[str, object]] = {}
+        for person in persons:
+            if not person.match_key:
+                raise ValueError("Person.match_key is required for upsert")
+            non_empty = _non_empty_values(person)
+            existing = merged.get(person.match_key)
+            if existing is None:
+                # Every row must carry the SAME set of keys for a multi-row INSERT,
+                # so we fill absent fields with None (missing -> NULL). COALESCE on
+                # conflict keeps existing values, so NULLs never overwrite good data.
+                payload = {field: non_empty.get(field) for field in _FIELDS}
+                payload["match_key"] = person.match_key
+                merged[person.match_key] = payload
+            else:
+                # Fill only the gaps left by earlier fragments of the same key.
+                for field in _FIELDS:
+                    if existing.get(field) in (None, "") and non_empty.get(field) not in (
+                        None,
+                        "",
+                    ):
+                        existing[field] = non_empty[field]
+
+        if not merged:
+            return 0
+
+        rows: list[dict[str, object]] = []
+        for payload in merged.values():
+            # Derived norm_name for the INSERT path (new rows). On conflict it is
+            # recomputed from the surviving full_name below.
+            payload["norm_name"] = compute_norm_name(payload.get("full_name"))
+            rows.append(payload)
+
+        session: Session = self._session_factory()
+        try:
+            stmt = pg_insert(PersonRow).values(rows)
+            # On conflict of match_key, keep existing non-null values and only
+            # fill gaps with the incoming value: COALESCE(existing, incoming).
+            # COALESCE(existing, incoming): keep existing value unless it is NULL,
+            # so we only fill gaps and never overwrite good data (idempotent).
+            update_cols = {
+                field: func.coalesce(PersonRow.__table__.c[field], stmt.excluded[field])
+                for field in _FIELDS
+            }
+            # norm_name follows the SURVIVING full_name: recompute it in SQL from the
+            # COALESCE of existing/incoming full_name so it stays consistent after a
+            # gap-fill. norm_sql() over the fixed literal below (no external input) is
+            # the same canonical expression used by the batch jobs and the backfill.
+            update_cols["norm_name"] = text(
+                norm_sql("COALESCE(persons.full_name, excluded.full_name)")
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["match_key"],
+                set_=update_cols,
+            )
+            session.execute(stmt)
+            session.commit()
+            logger.debug("native upsert batch size=%d", len(rows))
+            return len(rows)
         except Exception:
             session.rollback()
             raise

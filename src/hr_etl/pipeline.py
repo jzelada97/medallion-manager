@@ -2,25 +2,36 @@
 
 Flow per message: decode -> detect type -> store raw in lake (Mongo) -> buffer in
 Redis by person key -> when enough fragments, consolidate -> upsert in warehouse.
+
+Cross-linking: when a Personal fragment has both passport and a name, we register
+an alias (name -> passport key) in Redis. Later, when a Location/Professional
+arrives with a name-based key, we resolve the alias and redirect the fragment
+to the passport-based key, achieving the cross-join.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from hr_etl.cache.redis_buffer import RedisBuffer
 from hr_etl.lake.mongo_lake import MongoLake
 from hr_etl.logging_conf import get_logger
 from hr_etl.metrics.prometheus import (
+    CONSOLIDATIONS,
     MESSAGES_CONSUMED,
     MESSAGES_FAILED,
+    PENDING_FRAGMENTS,
+    PERSIST_SECONDS,
     PERSONS_PERSISTED,
     PROCESSING_SECONDS,
 )
+from hr_etl.models.db_models import FragmentLog
 from hr_etl.models.raw import FragmentType
 from hr_etl.processing.consolidator import consolidate
 from hr_etl.processing.detector import detect_type
-from hr_etl.processing.matcher import match_key
+from hr_etl.processing.matcher import build_full_name, match_key
+from hr_etl.processing.normalizer import normalize_message
 from hr_etl.warehouse.person_repo import PersonRepository
 
 logger = get_logger(__name__)
@@ -35,11 +46,32 @@ class Pipeline:
         buffer: RedisBuffer,
         repo: PersonRepository,
         min_fragments: int = 2,
+        session_factory=None,
     ) -> None:
         self._lake = lake
         self._buffer = buffer
         self._repo = repo
         self._min_fragments = min_fragments
+        self._session_factory = session_factory
+
+    def _register_cross_link(self, message: dict[str, Any], ftype: FragmentType, key: str) -> None:
+        """If a Personal fragment has passport + name, register the name as alias."""
+        if ftype != FragmentType.PERSONAL or not key.startswith("passport:"):
+            return
+        norm = normalize_message(message)
+        name = build_full_name(norm)
+        if name:
+            self._buffer.register_alias(name, key)
+
+    def _resolve_cross_link(self, key: str) -> str:
+        """Try to resolve a name-based key to a passport-based key via alias."""
+        if not key.startswith("name:"):
+            return key
+        resolved = self._buffer.resolve_alias(key)
+        if resolved:
+            logger.debug("cross-link resolved: %s -> %s", key, resolved)
+            return resolved
+        return key
 
     @PROCESSING_SECONDS.time()
     def process_message(self, message: dict[str, Any], offset: int | None = None) -> int | None:
@@ -60,19 +92,62 @@ class Pipeline:
                 logger.warning("fragment has no matching key; kept raw only")
                 return None
 
+            # Cross-linking: register alias if Personal, resolve if name-based
+            self._register_cross_link(message, ftype, key)
+            key = self._resolve_cross_link(key)
+
+            logger.debug("fragment type=%s key=%s", ftype.value, key)
             count = self._buffer.add_fragment(key, message, ftype.value)
+            PENDING_FRAGMENTS.set(count)
             if count < self._min_fragments:
                 return None
 
-            fragments = [(f["message"], FragmentType(f["type"])) for f in self._buffer.get_fragments(key)]
+            fragments = [
+                (f["message"], FragmentType(f["type"])) for f in self._buffer.get_fragments(key)
+            ]
             person = consolidate(fragments)
             if person is None:
                 return None
+            CONSOLIDATIONS.inc()
+            self._buffer.clear(key)
 
-            person_id = self._repo.upsert(person)
+            with PERSIST_SECONDS.time():
+                person_id = self._repo.upsert(person)
             PERSONS_PERSISTED.inc()
+
+            # Audit trail: log each fragment so SPLIT can recover them later
+            if self._session_factory is not None:
+                self._log_fragments(person_id, key, fragments)
+
             return person_id
         except Exception:  # never let one bad message kill the pipeline
             MESSAGES_FAILED.inc()
             logger.exception("error processing message")
             return None
+
+    def _log_fragments(
+        self,
+        person_id: int,
+        match_key: str,
+        fragments: list[tuple[dict[str, Any], FragmentType]],
+    ) -> None:
+        """Persist a FragmentLog row for each fragment that built this person."""
+        session = self._session_factory()
+        try:
+            # Limpiar entradas previas para este person_id (idempotente ante reinicios)
+            session.query(FragmentLog).filter(FragmentLog.person_id == person_id).delete()
+            for msg, ftype in fragments:
+                session.add(
+                    FragmentLog(
+                        person_id=person_id,
+                        match_key=match_key,
+                        fragment_type=ftype.value,
+                        payload=json.dumps(msg, ensure_ascii=False),
+                    )
+                )
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.warning("fragment_log write failed for person_id=%s", person_id)
+        finally:
+            session.close()
