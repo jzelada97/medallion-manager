@@ -4,8 +4,6 @@ Renders the chat interface and delegates all LLM + tool logic to the orchestrato
 Keeps conversation history in st.session_state across Streamlit reruns.
 """
 
-import os
-
 import streamlit as st
 
 from assistant.orchestrator import chat, is_available

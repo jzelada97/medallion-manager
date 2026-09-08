@@ -8,10 +8,15 @@ plus a duplicate-candidates view backed by the batch reconciliation (/candidates
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 
 import pandas as pd
 import requests
 import streamlit as st
+from assistant.bot import render_assistant_tab
+
+sys.path.append(str(Path(__file__).resolve().parent))
 
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 # The API caps `limit` at 500 per request, so page sizes stay within that.
@@ -126,11 +131,6 @@ st.divider()
 # --------------------------------------------------------------------------- #
 # Tabs: Personas | Duplicados
 # --------------------------------------------------------------------------- #
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).resolve().parent))
-from assistant.bot import render_assistant_tab
-
 tab_medallion, tab_persons, tab_dupes, tab_assistant = st.tabs(["🏅 Arquitectura", "👤 Personas", "🔗 Duplicados", "🤖 Asistente Virtual"])
 
 

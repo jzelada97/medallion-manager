@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 
 from groq import Groq
 from hr_etl.mcp.server import TOOLS_FN, TOOLS_SCHEMA
