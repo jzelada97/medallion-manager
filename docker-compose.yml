@@ -88,6 +88,7 @@ services:
     env_file: .env
     environment:
       API_URL: http://api:8000
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
     ports:
       - "8501:8501"
     depends_on: [api]

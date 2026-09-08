@@ -134,6 +134,8 @@ class Pipeline:
         """Persist a FragmentLog row for each fragment that built this person."""
         session = self._session_factory()
         try:
+            # Limpiar entradas previas para este person_id (idempotente ante reinicios)
+            session.query(FragmentLog).filter(FragmentLog.person_id == person_id).delete()
             for msg, ftype in fragments:
                 session.add(
                     FragmentLog(

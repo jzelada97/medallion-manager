@@ -12,7 +12,9 @@ from pathlib import Path
 import requests
 
 _API_URL = os.getenv("API_URL", "http://localhost:8000")
-_KNOWLEDGE = Path(__file__).parent.parent.parent.parent / "frontend" / "assistant" / "knowledge"
+_KNOWLEDGE = Path(
+    os.getenv("KNOWLEDGE_PATH", str(Path(__file__).resolve().parents[3] / "frontend" / "assistant" / "knowledge"))
+)
 
 
 def _api(path: str, params: dict | None = None) -> dict:

@@ -10,10 +10,7 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from groq import Groq
 from hr_etl.mcp.server import TOOLS_FN, TOOLS_SCHEMA
@@ -73,9 +70,6 @@ def chat(user_message: str, history: list[dict]) -> str:
                 "tool_call_id": tc.id,
                 "content": json.dumps(result, ensure_ascii=False),
             })
-
-        # Tools executed — force plain text response now
-        return _final_response(client, messages, model)
 
     return _final_response(client, messages, model)
 

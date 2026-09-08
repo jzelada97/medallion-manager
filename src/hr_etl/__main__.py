@@ -46,14 +46,15 @@ def main() -> None:
     # Warehouse (Postgres) — Silver layer
     engine = create_db_engine(settings.postgres_dsn)
     init_schema(engine)
-    repo = PersonRepository(make_session_factory(engine))
+    session_factory = make_session_factory(engine)
+    repo = PersonRepository(session_factory)
 
     # Gold layer (aggregates/views for fast querying)
     from hr_etl.warehouse.gold_layer import init_gold_schema
 
     init_gold_schema(engine)
 
-    pipeline = Pipeline(lake, buffer, repo, min_fragments=settings.consolidation_min_fragments)
+    pipeline = Pipeline(lake, buffer, repo, min_fragments=settings.consolidation_min_fragments, session_factory=session_factory)
     consumer = KafkaMessageConsumer(settings)
 
     logger.info(

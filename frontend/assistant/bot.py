@@ -5,12 +5,8 @@ Keeps conversation history in st.session_state across Streamlit reruns.
 """
 
 import os
-import sys
-from pathlib import Path
 
 import streamlit as st
-
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from assistant.orchestrator import chat, is_available
 

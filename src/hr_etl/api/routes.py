@@ -38,6 +38,30 @@ def _row_to_dict(row: PersonRow) -> dict:
     }
 
 
+def _build_filters(q, city, company, job, include_norm_name: bool = False):
+    """Build SQLAlchemy filter list shared by /persons and /gold/persons."""
+    filters = []
+    if city:
+        filters.append(func.lower(PersonRow.city) == city.strip().lower())
+    if company:
+        filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
+    if job:
+        filters.append(PersonRow.job.ilike(f"%{job.strip()}%"))
+    if q:
+        like = f"%{q.strip()}%"
+        name_cols = [
+            PersonRow.full_name.ilike(like),
+            PersonRow.company.ilike(like),
+            PersonRow.email.ilike(like),
+        ]
+        if include_norm_name:
+            name_cols.append(PersonRow.norm_name.ilike(like))
+        else:
+            name_cols += [PersonRow.name.ilike(like), PersonRow.lastname.ilike(like)]
+        filters.append(or_(*name_cols))
+    return filters
+
+
 def build_router(session_factory) -> APIRouter:
     """Build the API router bound to a SQLAlchemy session factory."""
     router = APIRouter()
@@ -65,24 +89,7 @@ def build_router(session_factory) -> APIRouter:
         """
         session = session_factory()
         try:
-            filters = []
-            if city:
-                filters.append(func.lower(PersonRow.city) == city.strip().lower())
-            if company:
-                filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
-            if job:
-                filters.append(PersonRow.job.ilike(f"%{job.strip()}%"))
-            if q:
-                like = f"%{q.strip()}%"
-                filters.append(
-                    or_(
-                        PersonRow.full_name.ilike(like),
-                        PersonRow.name.ilike(like),
-                        PersonRow.lastname.ilike(like),
-                        PersonRow.company.ilike(like),
-                        PersonRow.email.ilike(like),
-                    )
-                )
+            filters = _build_filters(q, city, company, job)
 
             base = select(PersonRow)
             count_stmt = select(func.count()).select_from(PersonRow)
@@ -221,23 +228,7 @@ def build_router(session_factory) -> APIRouter:
         """
         session = session_factory()
         try:
-            filters = []
-            if city:
-                filters.append(func.lower(PersonRow.city) == city.strip().lower())
-            if company:
-                filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
-            if job:
-                filters.append(PersonRow.job.ilike(f"%{job.strip()}%"))
-            if q:
-                like = f"%{q.strip()}%"
-                filters.append(
-                    or_(
-                        PersonRow.full_name.ilike(like),
-                        PersonRow.norm_name.ilike(like),
-                        PersonRow.company.ilike(like),
-                        PersonRow.email.ilike(like),
-                    )
-                )
+            filters = _build_filters(q, city, company, job, include_norm_name=True)
 
             base = select(PersonRow)
             count_stmt = select(func.count()).select_from(PersonRow)
