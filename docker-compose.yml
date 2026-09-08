@@ -85,6 +85,7 @@ services:
     build:
       context: .
       dockerfile: docker/Dockerfile.frontend
+    env_file: .env
     environment:
       API_URL: http://api:8000
     ports:
