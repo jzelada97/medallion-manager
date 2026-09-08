@@ -1,13 +1,22 @@
-"""Airflow DAGs for HR ETL batch maintenance tasks.
+"""Airflow DAG for HR ETL batch maintenance.
 
-These DAGs schedule periodic jobs that complement the real-time streaming pipeline:
-- Gold layer refresh (every 5 minutes)
-- Batch reconciliation for duplicate detection (every 30 minutes)
+A single SEQUENTIAL DAG runs the three maintenance jobs in strict data-dependency order:
 
-Each DAG uses a BashOperator to invoke the ETL CLI commands. The hr_etl package is
-made importable via PYTHONPATH=/opt/airflow/src (set in docker-compose.airflow.yml),
-and its runtime deps are installed into the Airflow image (Airflow 3 uses SQLAlchemy
-2.x, matching hr_etl, so no isolated environment is required).
+    consolidate_merge  >>  reconcile  >>  refresh_gold
+
+Order is mandatory (see architecture-reconcile.md):
+  1. consolidate_merge — merges same-person rows in `persons` (same passport + very
+     similar name), so downstream steps see de-duplicated, consolidated Silver data.
+  2. reconcile — groups probable duplicates by fuzzy name over the CLEAN state into
+     `duplicate_groups` (review candidates, never auto-merged).
+  3. refresh_gold — rebuilds `gold_persons` (the completeness-qualified subset) and the
+     `gold_*` stats over that subset, reflecting the final state.
+
+Running them out of order would build groups/Gold over dirty (un-consolidated) data.
+
+Each task is a BashOperator invoking the ETL CLIs. The hr_etl package is importable via
+PYTHONPATH=/opt/airflow/src (set in docker-compose.airflow.yml); its runtime deps are in
+the Airflow image (Airflow 3 uses SQLAlchemy 2.x, matching hr_etl).
 """
 
 from datetime import datetime, timedelta
@@ -29,37 +38,33 @@ default_args = {
     "retry_delay": timedelta(minutes=1),
 }
 
-# --- DAG 1: Refresh Gold layer (every 5 minutes) ---
-
+# Cadence is driven by the expensive step (reconciliation, ~2-4 min on the VM), so the
+# whole chain runs every 30 minutes. max_active_runs=1 prevents overlapping runs from
+# stepping on each other's `persons`/`gold_*` rebuilds.
 with DAG(
-    dag_id="hr_etl_refresh_gold",
+    dag_id="hr_etl_maintenance",
     default_args=default_args,
-    description="Refresh Gold layer aggregates (stats, top cities/companies, completeness)",
-    schedule="*/5 * * * *",
+    description="Sequential maintenance: consolidate -> reconcile -> refresh gold",
+    schedule="*/30 * * * *",
     start_date=datetime(2026, 1, 1),
     catchup=False,
-    tags=["hr-etl", "gold", "medallion"],
-) as dag_gold:
+    max_active_runs=1,
+    tags=["hr-etl", "maintenance", "medallion", "data-quality"],
+) as dag:
+
+    consolidate_merge = BashOperator(
+        task_id="consolidate_merge",
+        bash_command="python -m hr_etl.processing.consolidate_merge",
+    )
+
+    reconcile = BashOperator(
+        task_id="batch_reconciliation",
+        bash_command="python -m hr_etl.processing.reconcile",
+    )
 
     refresh_gold = BashOperator(
         task_id="refresh_gold_layer",
         bash_command="python -m hr_etl.warehouse.gold_layer",
     )
 
-
-# --- DAG 2: Batch reconciliation (every 30 minutes) ---
-
-with DAG(
-    dag_id="hr_etl_reconciliation",
-    default_args=default_args,
-    description="Detect probable duplicate persons via name prefix matching",
-    schedule="*/30 * * * *",
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
-    tags=["hr-etl", "reconciliation", "data-quality"],
-) as dag_reconcile:
-
-    run_reconciliation = BashOperator(
-        task_id="batch_reconciliation",
-        bash_command="python -m hr_etl.processing.reconcile",
-    )
+    consolidate_merge >> reconcile >> refresh_gold

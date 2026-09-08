@@ -3,16 +3,43 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
 
-from hr_etl.models.db_models import FragmentLog, MatchCandidate, PersonReview, PersonRow
-from hr_etl.processing.consolidator import consolidate
-from hr_etl.models.raw import FragmentType
+from hr_etl.models.db_models import (
+    GoldPerson,
+    MatchCandidate,
+    PersonReview,
+    PersonRow,
+)
+
+
+class ConsolidateRequest(BaseModel):
+    """Payload for POST /consolidate: the exactly-two person ids a human chose to merge.
+
+    Consolidation is reviewed pairwise (the reviewer compares two concrete records), so
+    the request carries exactly two ids; the UI enforces the same cap.
+    """
+
+    person_ids: list[int] = Field(
+        ..., min_length=2, max_length=2, description="Exactly 2 ids to merge"
+    )
+
+
+class ReviewRequest(BaseModel):
+    """Payload for POST /review/*: a single person a reviewer resolved.
+
+    ``person_id`` is the Silver row the reviewer acted on; the endpoint resolves its
+    stable ``match_key`` and records the verdict in ``person_reviews`` so it survives a
+    reprocess. ``note`` is an optional free-text annotation.
+    """
+
+    person_id: int = Field(..., description="Silver person id the reviewer resolved")
+    note: str | None = Field(None, max_length=255, description="Optional annotation")
 
 
 def _row_to_dict(row: PersonRow) -> dict:
@@ -38,32 +65,37 @@ def _row_to_dict(row: PersonRow) -> dict:
     }
 
 
-def _build_filters(q, city, company, job, include_norm_name: bool = False):
-    """Build SQLAlchemy filter list shared by /persons and /gold/persons."""
-    filters = []
-    if city:
-        filters.append(func.lower(PersonRow.city) == city.strip().lower())
-    if company:
-        filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
-    if job:
-        filters.append(PersonRow.job.ilike(f"%{job.strip()}%"))
-    if q:
-        like = f"%{q.strip()}%"
-        name_cols = [
-            PersonRow.full_name.ilike(like),
-            PersonRow.company.ilike(like),
-            PersonRow.email.ilike(like),
-        ]
-        if include_norm_name:
-            name_cols.append(PersonRow.norm_name.ilike(like))
-        else:
-            name_cols += [PersonRow.name.ilike(like), PersonRow.lastname.ilike(like)]
-        filters.append(or_(*name_cols))
-    return filters
+def _gold_row_to_dict(row: GoldPerson) -> dict:
+    return {
+        "id": row.id,
+        "passport": row.passport,
+        "full_name": row.full_name,
+        "name": row.name,
+        "lastname": row.lastname,
+        "sex": row.sex,
+        "phone": row.phone,
+        "email": row.email,
+        "city": row.city,
+        "address": row.address,
+        "company": row.company,
+        "company_address": row.company_address,
+        "company_phone": row.company_phone,
+        "company_email": row.company_email,
+        "job": row.job,
+        "iban": row.iban,
+        "salary": row.salary,
+        "ipv4": row.ipv4,
+        "completeness": row.completeness,
+    }
 
 
-def build_router(session_factory) -> APIRouter:
-    """Build the API router bound to a SQLAlchemy session factory."""
+def build_router(session_factory, mongo_count=None) -> APIRouter:
+    """Build the API router bound to a SQLAlchemy session factory.
+
+    ``mongo_count`` (optional): a zero-arg callable returning the number of raw
+    documents in the Bronze layer (MongoDB). Injected so the API stays decoupled
+    from Mongo and testable. If not provided, the Bronze count is reported as None.
+    """
     router = APIRouter()
 
     @router.get("/health")
@@ -89,7 +121,24 @@ def build_router(session_factory) -> APIRouter:
         """
         session = session_factory()
         try:
-            filters = _build_filters(q, city, company, job)
+            filters = []
+            if city:
+                filters.append(func.lower(PersonRow.city) == city.strip().lower())
+            if company:
+                filters.append(PersonRow.company.ilike(f"%{company.strip()}%"))
+            if job:
+                filters.append(PersonRow.job.ilike(f"%{job.strip()}%"))
+            if q:
+                like = f"%{q.strip()}%"
+                filters.append(
+                    or_(
+                        PersonRow.full_name.ilike(like),
+                        PersonRow.name.ilike(like),
+                        PersonRow.lastname.ilike(like),
+                        PersonRow.company.ilike(like),
+                        PersonRow.email.ilike(like),
+                    )
+                )
 
             base = select(PersonRow)
             count_stmt = select(func.count()).select_from(PersonRow)
@@ -190,6 +239,225 @@ def build_router(session_factory) -> APIRouter:
         finally:
             session.close()
 
+    @router.get("/groups")
+    def list_duplicate_groups(
+        limit: int = Query(50, ge=1, le=500),
+        min_confidence: float = Query(0.5, ge=0.0, le=1.0),
+    ) -> dict:
+        """List probable-duplicate GROUPS detected by fuzzy reconciliation.
+
+        Reads the pre-aggregated ``gold_duplicate_groups`` table (materialized by
+        ``refresh_gold`` once per maintenance cycle): one row per group, members already
+        resolved as JSON. This is a plain indexed ``SELECT ... LIMIT`` (<100ms) instead of
+        the old JOIN-everything-and-bundle-in-Python path (~11s on the prod dataset, and
+        recomputed on every page load / group select). Response shape is unchanged so the
+        frontend needs no change. Returns an empty list if Gold has not been refreshed yet
+        (or the table is absent on this backend) rather than erroring.
+        """
+        session = session_factory()
+        try:
+            total = session.execute(
+                text(
+                    "SELECT count(*) FROM gold_duplicate_groups "
+                    "WHERE max_confidence >= :min_conf"
+                ),
+                {"min_conf": min_confidence},
+            ).scalar_one()
+
+            rows = session.execute(
+                text(
+                    "SELECT group_id, max_confidence, reason, members "
+                    "FROM gold_duplicate_groups "
+                    "WHERE max_confidence >= :min_conf "
+                    "ORDER BY max_confidence DESC, group_id "
+                    "LIMIT :lim"
+                ),
+                {"min_conf": min_confidence, "lim": limit},
+            ).all()
+
+            groups = [
+                {
+                    "group_id": r.group_id,
+                    "confidence": r.max_confidence,
+                    "reason": r.reason,
+                    # members is JSONB on Postgres (driver -> list[dict]); on backends that
+                    # return it as a JSON string (e.g. SQLite TEXT) we parse it here so the
+                    # response shape is identical.
+                    "members": r.members if isinstance(r.members, list) else json.loads(r.members),
+                }
+                for r in rows
+            ]
+            return {
+                "total_groups": int(total),
+                "count": len(groups),
+                "groups": groups,
+            }
+        finally:
+            session.close()
+
+    @router.get("/gold/persons")
+    def list_gold_persons(
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+        after_id: int | None = Query(
+            None,
+            ge=0,
+            description="Keyset cursor: return rows with id > after_id (fast deep paging)",
+        ),
+        with_total: bool = Query(
+            False, description="Also compute the exact total (a COUNT; skip it when paging)"
+        ),
+        q: str | None = Query(None, description="Free-text search on name/company/email"),
+        city: str | None = None,
+        company: str | None = None,
+        job: str | None = None,
+    ) -> dict:
+        """List Gold-layer persons with filters, free-text search and pagination.
+
+        Same filter contract as ``/persons`` but scoped to ``gold_persons`` — the
+        curated, completeness-qualified, name-unique subset of Silver (see
+        ``warehouse/gold_layer.py``). Returns an empty page (not an error) if Gold has
+        not been refreshed yet or the table doesn't exist on this backend.
+
+        Pagination — two modes:
+        * KEYSET (preferred, pass ``after_id``): returns rows with ``id > after_id``
+          ordered by id. It rides the primary-key index, so page 5000 is as fast as page
+          1 (unlike OFFSET, which scans+discards every earlier row — ~10s deep into a
+          200k-row table). The response carries ``next_cursor`` (the last id on the page)
+          and ``has_more`` so the UI can offer Next without knowing the total.
+        * OFFSET (legacy fallback, pass ``offset``): kept for compatibility.
+
+        ``total`` is only computed when ``with_total=true`` (a full COUNT, expensive at
+        scale). During normal Next/Prev paging the UI does not need it, so it is skipped
+        and returned as None — ``has_more`` is enough to drive the buttons.
+        """
+        session = session_factory()
+        try:
+            filters = []
+            if city:
+                filters.append(func.lower(GoldPerson.city) == city.strip().lower())
+            if company:
+                filters.append(GoldPerson.company.ilike(f"%{company.strip()}%"))
+            if job:
+                filters.append(GoldPerson.job.ilike(f"%{job.strip()}%"))
+            if q:
+                like = f"%{q.strip()}%"
+                filters.append(
+                    or_(
+                        GoldPerson.full_name.ilike(like),
+                        GoldPerson.name.ilike(like),
+                        GoldPerson.lastname.ilike(like),
+                        GoldPerson.company.ilike(like),
+                        GoldPerson.email.ilike(like),
+                    )
+                )
+
+            base = select(GoldPerson)
+            for f in filters:
+                base = base.where(f)
+
+            # Fetch one extra row to detect whether another page exists without a COUNT.
+            if after_id is not None:
+                base = base.where(GoldPerson.id > after_id)
+                page = base.order_by(GoldPerson.id).limit(limit + 1)
+            else:
+                page = base.order_by(GoldPerson.id).limit(limit + 1).offset(offset)
+
+            rows = session.execute(page).scalars().all()
+            has_more = len(rows) > limit
+            rows = rows[:limit]
+            next_cursor = rows[-1].id if rows else None
+
+            total: int | None = None
+            if with_total:
+                count_stmt = select(func.count()).select_from(GoldPerson)
+                for f in filters:
+                    count_stmt = count_stmt.where(f)
+                total = session.execute(count_stmt).scalar_one()
+
+            return {
+                "total": total,
+                "count": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "next_cursor": next_cursor,
+                "has_more": has_more,
+                "items": [_gold_row_to_dict(r) for r in rows],
+            }
+        finally:
+            session.close()
+
+    @router.post("/consolidate")
+    def consolidate_persons(payload: ConsolidateRequest) -> dict:
+        """Merge a HUMAN-SELECTED set of person rows (from the Duplicados review pane).
+
+        Unlike the automatic batch jobs (consolidate_merge VÍA 1/2), this applies no
+        name-similarity or passport-non-contradiction gate: the caller's selection IS the
+        authorization to merge. Intended for ambiguous cases the automatic rules refuse
+        to guess (e.g. several same-name candidates where only a human can tell which
+        one is the real match). Runs in one transaction; 400 on invalid/missing ids.
+        """
+        from hr_etl.processing.consolidate_merge import run_manual_consolidation
+
+        session = session_factory()
+        try:
+            try:
+                merged = run_manual_consolidation(session, payload.person_ids)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            return {"merged": merged, "person_ids": sorted(set(payload.person_ids))}
+        finally:
+            session.close()
+
+    def _record_review(person_id: int, status: str, note: str | None) -> dict:
+        """Resolve a person's stable match_key and upsert a person_reviews verdict.
+
+        Shared by /review/approve and /review/distinct. Keyed by ``match_key`` so the
+        decision survives a reprocess (persons.id churns; match_key does not). Idempotent:
+        re-reviewing the same person overwrites the prior verdict. 404 if the id is gone
+        (e.g. already merged away), 400 if the row has no match_key.
+        """
+        session = session_factory()
+        try:
+            person = session.get(PersonRow, person_id)
+            if person is None:
+                raise HTTPException(status_code=404, detail=f"person {person_id} not found")
+            if not person.match_key:
+                raise HTTPException(status_code=400, detail=f"person {person_id} has no match_key")
+            existing = session.execute(
+                select(PersonReview).where(PersonReview.match_key == person.match_key)
+            ).scalar_one_or_none()
+            if existing is None:
+                session.add(PersonReview(match_key=person.match_key, status=status, note=note))
+            else:
+                existing.status = status
+                existing.survivor_match_key = None
+                existing.note = note
+            session.commit()
+            return {"person_id": person_id, "match_key": person.match_key, "status": status}
+        finally:
+            session.close()
+
+    @router.post("/review/approve")
+    def review_approve(payload: ReviewRequest) -> dict:
+        """Approve a person as the canonical record (force-promote to Gold).
+
+        Records status ``approved`` in ``person_reviews``. On the next Gold refresh the
+        row is promoted even if its name repeats in Silver (the automatic name-uniqueness
+        gate is bypassed for approved rows), and reconcile stops surfacing it for review.
+        """
+        return _record_review(payload.person_id, "approved", payload.note)
+
+    @router.post("/review/distinct")
+    def review_distinct(payload: ReviewRequest) -> dict:
+        """Mark a person as a DIFFERENT real individual that merely shares a name.
+
+        Records status ``distinct`` in ``person_reviews``. The row leaves the review queue
+        and is ignored by the Gold name-uniqueness anti-join, so its legitimate same-name
+        peers are no longer blocked from Gold. The row itself is not auto-promoted.
+        """
+        return _record_review(payload.person_id, "distinct", payload.note)
+
     @router.get("/gold/stats")
     def gold_stats() -> dict:
         """Pre-computed Gold layer statistics (faster than live aggregation)."""
@@ -207,61 +475,6 @@ def build_router(session_factory) -> APIRouter:
                 "with_ipv4": row.with_ipv4,
                 "cross_linked": row.cross_linked,
                 "avg_completeness": round(row.avg_completeness, 2),
-            }
-        finally:
-            session.close()
-
-    @router.get("/gold/persons")
-    def gold_persons(
-        limit: int = Query(50, ge=1, le=500),
-        offset: int = Query(0, ge=0),
-        q: str | None = Query(None),
-        city: str | None = None,
-        company: str | None = None,
-        job: str | None = None,
-    ) -> dict:
-        """Paginated person list optimised for the Gold/dashboard view.
-
-        Uses the same Silver table but returns only the columns needed by the
-        frontend, reducing payload size. Keyset pagination hint: pass the last
-        seen ``id`` as ``after_id`` for O(1) seeks on large datasets.
-        """
-        session = session_factory()
-        try:
-            filters = _build_filters(q, city, company, job, include_norm_name=True)
-
-            base = select(PersonRow)
-            count_stmt = select(func.count()).select_from(PersonRow)
-            for f in filters:
-                base = base.where(f)
-                count_stmt = count_stmt.where(f)
-
-            total = session.execute(count_stmt).scalar_one()
-            rows = (
-                session.execute(base.order_by(PersonRow.id).limit(limit).offset(offset))
-                .scalars()
-                .all()
-            )
-            return {
-                "total": total,
-                "count": len(rows),
-                "limit": limit,
-                "offset": offset,
-                "items": [
-                    {
-                        "id": r.id,
-                        "full_name": r.full_name,
-                        "city": r.city,
-                        "company": r.company,
-                        "job": r.job,
-                        "passport": r.passport,
-                        "email": r.email,
-                        "iban": r.iban,
-                        "salary": r.salary,
-                        "norm_name": r.norm_name,
-                    }
-                    for r in rows
-                ],
             }
         finally:
             session.close()
@@ -284,222 +497,53 @@ def build_router(session_factory) -> APIRouter:
         finally:
             session.close()
 
-    # ------------------------------------------------------------------ #
-    # Review queue (duplicates)
-    # ------------------------------------------------------------------ #
+    @router.get("/medallion")
+    def medallion() -> dict:
+        """Medallion architecture overview: counts for each layer.
 
-    @router.get("/review/queue")
-    def review_queue(
-        limit: int = Query(50, ge=1, le=500),
-        offset: int = Query(0, ge=0),
-    ) -> dict:
-        """Pending duplicate pairs awaiting human review."""
-        session = session_factory()
-        try:
-            stmt = (
-                select(PersonReview)
-                .where(PersonReview.status == "pending")
-                .order_by(PersonReview.id)
-                .limit(limit)
-                .offset(offset)
-            )
-            rows = session.execute(stmt).scalars().all()
-            total = session.execute(
-                select(func.count())
-                .select_from(PersonReview)
-                .where(PersonReview.status == "pending")
-            ).scalar_one()
-            return {
-                "total": total,
-                "items": [
-                    {
-                        "id": r.id,
-                        "person_id_a": r.person_id_a,
-                        "person_id_b": r.person_id_b,
-                        "status": r.status,
-                    }
-                    for r in rows
-                ],
-            }
-        finally:
-            session.close()
-
-    @router.post("/review/{review_id}/same")
-    def review_same(review_id: int) -> dict:
-        """Mark a review pair as confirmed same person (merge A into B).
-
-        Survivorship: all non-null fields from A fill gaps in B; A is deleted.
+        - Bronze: raw messages in the MongoDB data lake.
+        - Silver: consolidated/cleaned persons in Postgres.
+        - Gold: pre-computed aggregates (from gold_stats).
         """
         session = session_factory()
         try:
-            review = session.get(PersonReview, review_id)
-            if review is None:
-                raise HTTPException(status_code=404, detail="review not found")
-            if review.status != "pending":
-                raise HTTPException(status_code=409, detail=f"review already {review.status}")
-
-            row_a = session.get(PersonRow, review.person_id_a)
-            row_b = session.get(PersonRow, review.person_id_b)
-            if row_a is None or row_b is None:
-                raise HTTPException(status_code=404, detail="one or both persons not found")
-
-            # Merge A into B (fill B's gaps with A's values)
-            for field in (
-                "passport", "full_name", "name", "lastname", "sex", "phone", "email",
-                "city", "address", "company", "company_address", "company_phone",
-                "company_email", "job", "iban", "salary", "ipv4",
-            ):
-                val_a = getattr(row_a, field)
-                if val_a not in (None, "") and getattr(row_b, field) in (None, ""):
-                    setattr(row_b, field, val_a)
-
-            # Re-point A's fragment_log rows to B, then delete A
-            session.execute(
-                text("UPDATE fragment_log SET person_id = :b WHERE person_id = :a"),
-                {"b": row_b.id, "a": row_a.id},
-            )
-            session.delete(row_a)
-
-            review.status = "same"
-            review.reviewed_at = datetime.now(timezone.utc)
-            session.commit()
-            return {"merged_into": row_b.id}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            session.rollback()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        finally:
-            session.close()
-
-    @router.post("/review/{review_id}/distinct")
-    def review_distinct(review_id: int) -> dict:
-        """SPLIT/UNMERGE: the two persons are different people.
-
-        Recovers the original fragments from fragment_log, re-consolidates each
-        person independently under their correct match_key, and refreshes both
-        rows in the warehouse. Removes the pair from the review queue.
-        """
-        session = session_factory()
-        try:
-            review = session.get(PersonReview, review_id)
-            if review is None:
-                raise HTTPException(status_code=404, detail="review not found")
-            if review.status != "pending":
-                raise HTTPException(status_code=409, detail=f"review already {review.status}")
-
-            row_a = session.get(PersonRow, review.person_id_a)
-            row_b = session.get(PersonRow, review.person_id_b)
-            if row_a is None or row_b is None:
-                raise HTTPException(status_code=404, detail="one or both persons not found")
-
-            results = []
-            for row in (row_a, row_b):
-                logs = (
-                    session.execute(
-                        select(FragmentLog).where(FragmentLog.person_id == row.id)
-                    )
-                    .scalars()
-                    .all()
+            silver = session.execute(select(func.count()).select_from(PersonRow)).scalar_one()
+            gold_row = session.execute(
+                text(
+                    "SELECT total_persons, cross_linked, avg_completeness FROM gold_stats WHERE id = 1"
                 )
-                if not logs:
-                    # No audit trail — nothing to split, leave row as-is
-                    results.append({"person_id": row.id, "action": "unchanged", "reason": "no fragment_log"})
-                    continue
-
-                # Group fragments by their original match_key
-                by_key: dict[str, list[tuple[dict, FragmentType]]] = {}
-                for log in logs:
-                    ftype = FragmentType(log.fragment_type)
-                    msg = json.loads(log.payload)
-                    by_key.setdefault(log.match_key, []).append((msg, ftype))
-
-                if len(by_key) == 1:
-                    # All fragments share the same key — nothing to split
-                    results.append({"person_id": row.id, "action": "unchanged", "reason": "single key"})
-                    continue
-
-                # Re-consolidate each key group independently
-                new_ids = []
-                for key, frags in by_key.items():
-                    person = consolidate(frags)
-                    if person is None:
-                        continue
-                    person.match_key = key
-
-                    # Check if a row already exists for this key
-                    existing = session.execute(
-                        select(PersonRow).where(PersonRow.match_key == key)
-                    ).scalar_one_or_none()
-
-                    if existing is None:
-                        new_row = PersonRow(match_key=key)
-                        for field in (
-                            "passport", "full_name", "name", "lastname", "sex", "phone",
-                            "email", "city", "address", "company", "company_address",
-                            "company_phone", "company_email", "job", "iban", "salary", "ipv4",
-                        ):
-                            setattr(new_row, field, getattr(person, field))
-                        session.add(new_row)
-                        session.flush()  # get new_row.id
-                        # Re-point fragment_log rows
-                        for log in logs:
-                            if log.match_key == key:
-                                log.person_id = new_row.id
-                        new_ids.append(new_row.id)
-                    else:
-                        new_ids.append(existing.id)
-
-                # Delete the original merged row if it was replaced
-                if row.id not in new_ids:
-                    session.delete(row)
-
-                results.append({"person_id": row.id, "action": "split", "new_ids": new_ids})
-
-            review.status = "distinct"
-            review.reviewed_at = datetime.now(timezone.utc)
-            session.commit()
-            return {"status": "split", "results": results}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            session.rollback()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
+            ).fetchone()
         finally:
             session.close()
 
-    @router.post("/review/enqueue")
-    def enqueue_review(person_id_a: int, person_id_b: int) -> dict:
-        """Add a candidate pair to the review queue (idempotent)."""
-        session = session_factory()
-        try:
-            # Check both persons exist
-            for pid in (person_id_a, person_id_b):
-                if session.get(PersonRow, pid) is None:
-                    raise HTTPException(status_code=404, detail=f"person {pid} not found")
-            # Idempotent: skip if already pending
-            existing = session.execute(
-                select(PersonReview).where(
-                    PersonReview.person_id_a == min(person_id_a, person_id_b),
-                    PersonReview.person_id_b == max(person_id_a, person_id_b),
-                    PersonReview.status == "pending",
-                )
-            ).scalar_one_or_none()
-            if existing:
-                return {"id": existing.id, "created": False}
-            review = PersonReview(
-                person_id_a=min(person_id_a, person_id_b),
-                person_id_b=max(person_id_a, person_id_b),
-            )
-            session.add(review)
-            session.commit()
-            return {"id": review.id, "created": True}
-        except HTTPException:
-            raise
-        except Exception as exc:
-            session.rollback()
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        finally:
-            session.close()
+        # Bronze lives in Mongo; the API is decoupled from it. If the count fails
+        # (Mongo down, not configured), report None rather than crashing the endpoint.
+        bronze: int | None = None
+        if mongo_count is not None:
+            try:
+                bronze = int(mongo_count())
+            except Exception:  # noqa: BLE001 - Bronze is best-effort for the dashboard
+                bronze = None
+
+        return {
+            "bronze": {
+                "store": "MongoDB",
+                "name": "raw messages",
+                "count": bronze,
+            },
+            "silver": {
+                "store": "PostgreSQL",
+                "name": "consolidated persons",
+                "count": silver,
+            },
+            "gold": {
+                "store": "PostgreSQL",
+                "name": "aggregates",
+                "refreshed": gold_row is not None,
+                "total_persons": gold_row.total_persons if gold_row else None,
+                "cross_linked": gold_row.cross_linked if gold_row else None,
+                "avg_completeness": (round(gold_row.avg_completeness, 2) if gold_row else None),
+            },
+        }
 
     return router

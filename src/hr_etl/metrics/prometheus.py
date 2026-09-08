@@ -46,3 +46,31 @@ PENDING_FRAGMENTS = Gauge(
     "hr_etl_pending_fragments",
     "Fragments currently buffered for a person key awaiting consolidation",
 )
+
+# --- Batch maintenance jobs (consolidation / reconciliation / gold) ---
+# All labels/values are numeric or fixed job names — never PII (NFR-5, C-4).
+
+CONSOLIDATION_MERGED_ROWS = Counter(
+    "hr_etl_consolidation_merged_rows_total",
+    "Total person rows merged away (deleted losers) by the consolidation fix job",
+)
+
+RECONCILE_DURATION_SECONDS = Histogram(
+    "hr_etl_reconcile_duration_seconds",
+    "Wall-clock duration of a full batch reconciliation run",
+)
+
+RECONCILE_GROUPS = Gauge(
+    "hr_etl_reconcile_groups",
+    "Number of duplicate groups produced by the last reconciliation run",
+)
+
+RECONCILE_MEMBERSHIPS = Gauge(
+    "hr_etl_reconcile_memberships",
+    "Number of duplicate-group memberships written by the last reconciliation run",
+)
+
+GOLD_PERSONS = Gauge(
+    "hr_etl_gold_persons",
+    "Number of persons in the Gold subset after the last gold refresh",
+)
