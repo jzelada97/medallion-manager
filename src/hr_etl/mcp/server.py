@@ -13,7 +13,10 @@ import requests
 
 _API_URL = os.getenv("API_URL", "http://localhost:8000")
 _KNOWLEDGE = Path(
-    os.getenv("KNOWLEDGE_PATH", str(Path(__file__).resolve().parents[3] / "frontend" / "assistant" / "knowledge"))
+    os.getenv(
+        "KNOWLEDGE_PATH",
+        str(Path(__file__).resolve().parents[3] / "frontend" / "assistant" / "knowledge"),
+    )
 )
 
 
@@ -29,6 +32,7 @@ def _read_md(name: str) -> str:
 
 
 # ── datos / métricas ────────────────────────────────────────────────────────
+
 
 def get_stats() -> dict:
     """Totales y KPIs del warehouse: personas, con banco, top ciudad, top empresa."""
@@ -92,6 +96,7 @@ def search_person(
 
 # ── explicación del proyecto (contenido curado) ─────────────────────────────
 
+
 def explain_project() -> dict:
     """Qué es HR Insights ETL, objetivo y niveles implementados."""
     return {"content": _read_md("project")}
@@ -143,7 +148,12 @@ TOOLS_SCHEMA: list[dict] = [
             "description": "Ranking de ciudades con más personas consolidadas.",
             "parameters": {
                 "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "Número de ciudades a devolver (default 10)"}},
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Número de ciudades a devolver (default 10)",
+                    }
+                },
                 "required": [],
             },
         },
@@ -155,7 +165,12 @@ TOOLS_SCHEMA: list[dict] = [
             "description": "Ranking de empresas con más personas consolidadas.",
             "parameters": {
                 "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "Número de empresas a devolver (default 10)"}},
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Número de empresas a devolver (default 10)",
+                    }
+                },
                 "required": [],
             },
         },
@@ -175,7 +190,12 @@ TOOLS_SCHEMA: list[dict] = [
             "description": "Pares de registros candidatos a duplicado con score de confianza.",
             "parameters": {
                 "type": "object",
-                "properties": {"limit": {"type": "integer", "description": "Número máximo de candidatos (default 20)"}},
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Número máximo de candidatos (default 20)",
+                    }
+                },
                 "required": [],
             },
         },
@@ -188,7 +208,10 @@ TOOLS_SCHEMA: list[dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "q": {"type": "string", "description": "Búsqueda libre (nombre, email, passport)"},
+                    "q": {
+                        "type": "string",
+                        "description": "Búsqueda libre (nombre, email, passport)",
+                    },
                     "city": {"type": "string", "description": "Filtrar por ciudad"},
                     "company": {"type": "string", "description": "Filtrar por empresa"},
                     "job": {"type": "string", "description": "Filtrar por puesto"},

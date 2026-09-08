@@ -131,7 +131,9 @@ st.divider()
 # --------------------------------------------------------------------------- #
 # Tabs: Personas | Duplicados
 # --------------------------------------------------------------------------- #
-tab_medallion, tab_persons, tab_dupes, tab_assistant = st.tabs(["🏅 Arquitectura", "👤 Personas", "🔗 Duplicados", "🤖 Asistente Virtual"])
+tab_medallion, tab_persons, tab_dupes, tab_assistant = st.tabs(
+    ["🏅 Arquitectura", "👤 Personas", "🔗 Duplicados", "🤖 Asistente Virtual"]
+)
 
 
 # --------------------------------------------------------------------------- #

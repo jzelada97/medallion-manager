@@ -54,7 +54,13 @@ def main() -> None:
 
     init_gold_schema(engine)
 
-    pipeline = Pipeline(lake, buffer, repo, min_fragments=settings.consolidation_min_fragments, session_factory=session_factory)
+    pipeline = Pipeline(
+        lake,
+        buffer,
+        repo,
+        min_fragments=settings.consolidation_min_fragments,
+        session_factory=session_factory,
+    )
     consumer = KafkaMessageConsumer(settings)
 
     logger.info(
