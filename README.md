@@ -11,6 +11,11 @@ Docker Compose.
 > independiente del generador de datos (no se basa en inspeccionar cómo genera los datos).
 > Cerrada esa fase, el generador puede incluirse/desplegarse si hace falta para la demo.
 
+![Dashboard de HR Insights: KPIs, top ciudades y empresas, y la vista Medallion en vivo](docs/img/dashboard.png)
+
+*Datos reales de la VM: 6.931.820 mensajes crudos en Bronze → 2.024.632 personas
+consolidadas en Silver → 268.820 en Gold. Cada persona consolidada viene de ~3,4 mensajes.*
+
 ---
 
 ## Tabla de contenidos
@@ -24,11 +29,12 @@ Docker Compose.
 7. [Desarrollo local](#desarrollo-local)
 8. [API REST](#api-rest)
 9. [Frontend (Streamlit)](#frontend-streamlit)
-10. [Monitorizacion (Prometheus)](#monitorizacion-prometheus)
-11. [Tests y calidad](#tests-y-calidad)
-12. [Configuracion](#configuracion)
-13. [Limitaciones conocidas y mejoras futuras](#limitaciones-conocidas-y-mejoras-futuras)
-14. [Equipo y gestion](#equipo-y-gestion)
+10. [Asistente virtual (MCP + Groq)](#asistente-virtual-mcp--groq)
+11. [Monitorizacion (Prometheus)](#monitorizacion-prometheus)
+12. [Tests y calidad](#tests-y-calidad)
+13. [Configuracion](#configuracion)
+14. [Limitaciones conocidas y mejoras futuras](#limitaciones-conocidas-y-mejoras-futuras)
+15. [Equipo y gestion](#equipo-y-gestion)
 
 ---
 
@@ -209,8 +215,10 @@ Proyecto1_modulo3_DE2/
 │   ├── models/                 # Pydantic (Person) + SQLAlchemy (PersonRow, MatchCandidate)
 │   ├── processing/reconcile.py # Reconciliacion batch (candidatos a duplicado)
 │   ├── airflow_ext/            # Sensor deferrable para el DAG event-driven
+│   ├── mcp/                    # Herramientas del asistente (funciones planas sobre la API)
 │   └── api/                    # FastAPI endpoints
-├── frontend/                   # Streamlit dashboard (Arquitectura, Personas, Duplicados)
+├── frontend/                   # Streamlit dashboard (4 pestañas)
+│   └── assistant/              # Orquestador Groq + knowledge/ (markdown curado)
 ├── airflow/dags/               # DAGs: refresh Gold (event-driven) + reconciliacion
 ├── tests/                      # pytest (unit + integracion)
 ├── docker/                     # Dockerfiles (app, api, frontend)
@@ -242,6 +250,7 @@ Proyecto1_modulo3_DE2/
 | Pydantic 2 | Modelos y config | Validacion en runtime, `pydantic-settings` para config 12-factor |
 | FastAPI | API REST | Async, autodocumentacion Swagger, rapida |
 | Streamlit | Frontend | Dashboard interactivo en Python sin necesidad de JS |
+| Groq | LLM del asistente | Tool calling en el free tier y latencia baja; el modelo se cambia por variable de entorno |
 | Prometheus | Metricas | Standard para observabilidad, facil de instrumentar |
 | Docker + Compose | Infraestructura | Entorno reproducible, healthchecks, redes aisladas |
 | pytest | Tests | Framework standard, fixtures, coverage integrada |
@@ -677,7 +686,7 @@ Base URL: `http://localhost:8000`
 
 ## Frontend (Streamlit)
 
-Dashboard interactivo en http://localhost:8501 con tres pestañas:
+Dashboard interactivo en http://localhost:8501 con cuatro pestañas:
 
 - **🏅 Arquitectura**: vista Medallion en vivo (Bronze → Silver → Gold) con los conteos
   de cada capa y el ratio de mensajes crudos por persona consolidada.
@@ -685,9 +694,96 @@ Dashboard interactivo en http://localhost:8501 con tres pestañas:
   tamaño de página (25–500), paginación con botones Anterior/Siguiente, tabla de
   resultados y ficha de detalle al seleccionar una persona. Arriba, tarjetas de métricas
   y gráficos de barras (top ciudades, top empresas) desde `/stats`.
-- **🔗 Duplicados**: candidatos a duplicado de la reconciliación (`/candidates`) con la
-  confianza como barra de progreso, filtro por confianza mínima y comparación lado a
-  lado de las dos personas de cada par.
+- **🔗 Duplicados**: la cola de revisión humana. Ver abajo.
+- **🤖 Asistente Virtual**: el chatbot con tool-calling. Ver
+  [Asistente virtual](#asistente-virtual-mcp--groq).
+
+### La pestaña Duplicados: donde el humano decide
+
+![Cola de revisión de duplicados: grupos por similitud de nombre y las tres acciones de resolución](docs/img/duplicados.png)
+
+La reconciliación **nunca fusiona**: agrupa y propone. Esta pestaña es el otro lado de esa
+decisión de diseño. Muestra los **grupos** de `duplicate_groups` (no pares — el modelo de
+pares es legacy), con filtro de confianza mínima, límite de grupos y el motivo de cada uno
+(`exact_name` / `fuzzy_name` / `name_containment`).
+
+Al inspeccionar un grupo se ve el detalle de cada miembro y hay **tres formas de
+resolverlo, todas persistentes** — sobreviven al reprocesado y al rebuild de la
+reconciliación:
+
+| Acción | Qué significa | Efecto |
+|---|---|---|
+| **🔗 Consolidar** (exactamente 2) | Estas dos filas son la MISMA persona | Se fusionan en una (sobrevive el `id` menor) y se guarda la traza del merge |
+| **✅ Aprobar como canónica** | Esta fila es la buena y está completa | Se promociona a Gold aunque el nombre se repita |
+| **🔀 Marcar como distinta** | Es otra persona real con el mismo nombre (homónimo) | Sale de la cola y deja de bloquear a sus pares |
+
+El caso de la captura lo explica solo: 19 personas agrupadas como "Valentina Alvarez" por
+contención de nombre, con pasaportes distintos y uno nulo. Ninguna máquina debería decidir
+eso; el sistema lo reconoce y lo escala a una persona.
+
+---
+
+## Asistente virtual (MCP + Groq)
+
+![Asistente virtual con Groq y MCP conectados, respondiendo sobre los datos reales del warehouse](docs/img/asistente.png)
+
+Un chatbot que responde sobre **los datos reales del warehouse** y sobre cómo está hecho el
+proyecto. No es un wrapper de ChatGPT sobre el README: cada respuesta sale de ejecutar una
+herramienta contra la API que ya existía.
+
+### El diseño: jardín amurallado
+
+El modelo **no ve la base de datos ni escribe SQL**. Solo puede llamar a una lista cerrada
+de funciones, y cada una de ellas llama a un endpoint concreto de la API REST. Lo que no
+esté en esa lista, no se puede hacer — y el asistente lo dice en vez de inventárselo.
+
+```
+Streamlit  →  orchestrator.py  →  Groq (tool-calling)
+                    │                   │
+                    │     ← tool_calls ─┘
+                    ▼
+             hr_etl/mcp/server.py  →  API REST  →  PostgreSQL
+                    │
+                    └→  knowledge/*.md   (contenido curado, no generado)
+```
+
+### Las herramientas
+
+Nueve funciones planas, sin decoradores ni FastMCP. El esquema que ve el modelo
+(`TOOLS_SCHEMA`) y el despacho real (`TOOLS_FN`) viven en el mismo módulo, así no pueden
+divergir.
+
+| Grupo | Herramientas | Fuente |
+|---|---|---|
+| Datos y métricas | `get_stats`, `top_cities`, `top_companies`, `completeness_distribution`, `duplicate_candidates`, `search_person` | La API REST (`/stats`, `/gold/completeness`, `/candidates`, `/persons`) |
+| Explicación del proyecto | `explain_project`, `explain_architecture`, `explain_matching`, `explain_how_built` | Markdown curado en `frontend/assistant/knowledge/` |
+
+Las cuatro de explicación devuelven texto **escrito a mano**, no generado. Es la diferencia
+entre un asistente que explica el proyecto y uno que improvisa sobre él.
+
+### Aviso de PII, forzado por el sistema
+
+`search_person` devuelve datos de persona, así que **siempre** adjunta un campo
+`_pii_warning`, y el system prompt obliga al modelo a incluirlo al final de la respuesta:
+
+> ⚠️ Datos sintéticos de demostración. En un sistema real estos campos (passport, IBAN,
+> salario, email, teléfono) NO se mostrarían en un chat.
+
+El aviso lo pone la herramienta, no el modelo. Si el modelo lo omitiera, seguiría estando
+en el payload; y el que decide mostrarlo no es quien lo genera.
+
+### Configuración
+
+Sin `GROQ_API_KEY` el resto del dashboard funciona igual: la pestaña avisa de que el
+asistente está desactivado y las otras tres no se enteran.
+
+| Variable | Por defecto | Para qué |
+|---|---|---|
+| `GROQ_API_KEY` | — | Sin ella el asistente se desactiva (`is_available()`) |
+| `GROQ_MODEL` | `openai/gpt-oss-120b` | Modelo servido por Groq |
+| `LLM_TEMPERATURE` | `0.1` | Baja a propósito: se quieren datos, no prosa |
+| `LLM_MAX_TOKENS` | `1024` | Techo de respuesta |
+| `ASSISTANT_MAX_TOOL_CALLS` | `4` | Vueltas máximas del bucle de tools; corta bucles infinitos |
 
 ---
 
@@ -771,6 +867,11 @@ completo. Las principales:
 | `CONSOLIDATION_MIN_FRAGMENTS` | 2 | Minimo de fragmentos para consolidar |
 | `MAX_RECORDS` | None | Limite de mensajes (None = infinito) |
 | `LOG_LEVEL` | INFO | Nivel de logging |
+| `GROQ_API_KEY` | - | Clave del asistente. Sin ella el chatbot se desactiva y el resto del dashboard sigue igual |
+| `GROQ_MODEL` | openai/gpt-oss-120b | Modelo servido por Groq |
+| `LLM_TEMPERATURE` | 0.1 | Baja a proposito: se quieren datos, no prosa |
+| `LLM_MAX_TOKENS` | 1024 | Techo de respuesta del asistente |
+| `ASSISTANT_MAX_TOOL_CALLS` | 4 | Vueltas maximas del bucle de tools (corta bucles infinitos) |
 
 ---
 
