@@ -27,4 +27,3 @@
 - `docker/` — Dockerfiles
 - `airflow/dags/` — DAGs de Airflow
 - `monitoring/` — prometheus.yml + Grafana dashboards
-- `specs/` — especificaciones de features

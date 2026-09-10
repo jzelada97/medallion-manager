@@ -1,7 +1,7 @@
 """12-factor configuration loaded from environment variables.
 
 All credentials and connection details come from the environment. Never hardcode
-secrets here (see .kiro/steering/00-critical-rules.md, Rule #2).
+secrets here.
 """
 
 from __future__ import annotations
