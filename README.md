@@ -11,7 +11,7 @@ Docker Compose.
 > independiente del generador de datos (no se basa en inspeccionar cómo genera los datos).
 > Cerrada esa fase, el generador puede incluirse/desplegarse si hace falta para la demo.
 
-![Dashboard de HR Insights: KPIs, top ciudades y empresas, y la vista Medallion en vivo](docs/img/dashboard.png)
+![Dashboard de HR Insights: KPIs, top ciudades y empresas, y la vista Medallion en vivo](assets/dashboard.png)
 
 *Datos reales de la VM: 6.931.820 mensajes crudos en Bronze → 2.024.632 personas
 consolidadas en Silver → 268.820 en Gold. Cada persona consolidada viene de ~3,4 mensajes.*
@@ -700,7 +700,7 @@ Dashboard interactivo en http://localhost:8501 con cuatro pestañas:
 
 ### La pestaña Duplicados: donde el humano decide
 
-![Cola de revisión de duplicados: grupos por similitud de nombre y las tres acciones de resolución](docs/img/duplicados.png)
+![Cola de revisión de duplicados: grupos por similitud de nombre y las tres acciones de resolución](assets/duplicados.png)
 
 La reconciliación **nunca fusiona**: agrupa y propone. Esta pestaña es el otro lado de esa
 decisión de diseño. Muestra los **grupos** de `duplicate_groups` (no pares — el modelo de
@@ -725,7 +725,7 @@ eso; el sistema lo reconoce y lo escala a una persona.
 
 ## Asistente virtual (MCP + Groq)
 
-![Asistente virtual con Groq y MCP conectados, respondiendo sobre los datos reales del warehouse](docs/img/asistente.png)
+![Asistente virtual con Groq y MCP conectados, respondiendo sobre los datos reales del warehouse](assets/asistente.png)
 
 Un chatbot que responde sobre **los datos reales del warehouse** y sobre cómo está hecho el
 proyecto. No es un wrapper de ChatGPT sobre el README: cada respuesta sale de ejecutar una
