@@ -14,7 +14,7 @@
 #   ./scripts/run-airflow-tests.sh
 set -euo pipefail
 
-CONTAINER="proyecto1_modulo3_de2-airflow-scheduler-1"
+CONTAINER="medallion-manager-airflow-scheduler-1"
 TEST_FILE="tests/test_persons_threshold.py"
 
 if [ -z "$(docker ps --filter "name=${CONTAINER}" --filter "status=running" --format '{{.Names}}')" ]; then

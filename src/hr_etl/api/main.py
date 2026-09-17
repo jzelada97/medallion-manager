@@ -43,6 +43,6 @@ def create_app(session_factory=None, mongo_count=None) -> FastAPI:
     if mongo_count is None:
         mongo_count = _make_mongo_count(settings)
 
-    app = FastAPI(title="HR Insights API", version="0.1.0")
+    app = FastAPI(title="Medallion Manager API", version="0.1.0")
     app.include_router(build_router(session_factory, mongo_count=mongo_count))
     return app

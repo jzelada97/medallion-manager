@@ -139,5 +139,5 @@ networks:
     external: true
     # The main stack creates this network as <compose-project>_hr_net. The project name
     # defaults to the repo folder name, so it differs per checkout (e.g. hr-etl_hr_net
-    # on the VM, proyecto1_modulo3_de2_hr_net locally). Override via HR_NET_NAME in .env.
-    name: ${HR_NET_NAME:-proyecto1_modulo3_de2_hr_net}
+    # on the VM, medallion-manager_hr_net locally). Override via HR_NET_NAME in .env.
+    name: ${HR_NET_NAME:-medallion-manager_hr_net}

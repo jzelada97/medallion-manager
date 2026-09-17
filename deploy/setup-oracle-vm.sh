@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot setup for the HR Insights ETL demo on a fresh Oracle Cloud (OCI)
+# One-shot setup for the Medallion Manager demo on a fresh Oracle Cloud (OCI)
 # Always-Free Ubuntu VM (ARM Ampere A1 or x86). Run it as a user with sudo.
 #
 #   curl -fsSL <raw-url>/deploy/setup-oracle-vm.sh -o setup.sh
@@ -18,7 +18,7 @@
 # the Oracle web console. See deploy/DEPLOY-oracle.md.
 set -euo pipefail
 
-REPO_URL="${REPO_URL:-https://github.com/Bootcamp-IA-MAD-P7/Proyecto1_modulo3_DE2.git}"
+REPO_URL="${REPO_URL:-https://github.com/jzelada97/medallion-manager.git}"
 APP_DIR="${APP_DIR:-$HOME/hr-etl}"
 DOMAIN="${DOMAIN:-}"
 

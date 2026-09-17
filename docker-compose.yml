@@ -1,4 +1,4 @@
-# HR Insights ETL — full stack.
+# Medallion Manager — full stack.
 # NOTE: the Kafka broker/generator is provided separately (black box) and runs from
 # its own docker-compose. This app connects to it over the network. Set
 # KAFKA_BOOTSTRAP_SERVERS accordingly (e.g. host.docker.internal:9092 on Docker Desktop).

@@ -1,4 +1,4 @@
-# HR Insights ETL — Arquitectura
+# Medallion Manager — Arquitectura
 
 ## Flujo principal
 Kafka → Consumer → Detector de tipo → MongoDB (Data Lake, dato crudo) → Matcher → Redis Buffer → Consolidator → PostgreSQL (Data Warehouse) → API FastAPI → Streamlit

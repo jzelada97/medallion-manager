@@ -14,7 +14,7 @@
 
 $ErrorActionPreference = "Stop"
 
-$container = "proyecto1_modulo3_de2-airflow-scheduler-1"
+$container = "medallion-manager-airflow-scheduler-1"
 $testFile = "tests/test_persons_threshold.py"
 
 # 1) Is the container running?

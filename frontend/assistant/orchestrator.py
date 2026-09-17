@@ -18,7 +18,7 @@ _TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.1"))
 _MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1024"))
 _MAX_TOOL_CALLS = int(os.getenv("ASSISTANT_MAX_TOOL_CALLS", "4"))
 
-_SYSTEM_PROMPT = """Eres el Asistente Técnico Oficial de HR Insights ETL.
+_SYSTEM_PROMPT = """Eres el Asistente Técnico Oficial de Medallion Manager.
 
 REGLAS:
 1. Usa las herramientas disponibles para responder. Cuando una herramienta devuelva un campo "content", usa ese texto como base de tu respuesta.

@@ -11,7 +11,7 @@ from assistant.orchestrator import chat, is_available
 SYSTEM_MESSAGE = {
     "role": "assistant",
     "content": (
-        "¡Hola! 👋 Soy el asistente técnico de **HR Insights ETL**.\n\n"
+        "¡Hola! 👋 Soy el asistente técnico de **Medallion Manager**.\n\n"
         "Puedo consultar datos reales del warehouse y explicar el proyecto. "
         "Prueba: *¿cuántas personas hay?*, *top ciudades*, "
         "*¿cómo funciona el matching?* o *busca personas en Madrid*."
@@ -20,7 +20,7 @@ SYSTEM_MESSAGE = {
 
 
 def render_assistant_tab():
-    st.title("🤖 Asistente Virtual HR Insights ETL")
+    st.title("🤖 Asistente Virtual Medallion Manager")
     st.caption("Asistente amurallado con herramientas MCP y Groq")
 
     if is_available():

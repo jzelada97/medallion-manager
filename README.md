@@ -1,6 +1,6 @@
-# HR Insights ETL
+# Medallion Manager
 
-Sistema de ingenieria de datos en tiempo real para **HR Insights**: consume mensajes fragmentados
+Sistema de ingenieria de datos en tiempo real para RRHH: consume mensajes fragmentados
 desde Apache Kafka, los almacena crudos en **MongoDB** (Data Lake), agrupa y normaliza los
 fragmentos de cada persona, y persiste el registro consolidado en **PostgreSQL** (Data Warehouse).
 Incluye cache **Redis** para buffering intermedio, metricas **Prometheus**, **API** REST de
@@ -11,7 +11,7 @@ Docker Compose.
 > independiente del generador de datos (no se basa en inspeccionar cómo genera los datos).
 > Cerrada esa fase, el generador puede incluirse/desplegarse si hace falta para la demo.
 
-![Dashboard de HR Insights: KPIs, top ciudades y empresas, y la vista Medallion en vivo](assets/dashboard.png)
+![Dashboard de Medallion Manager: KPIs, top ciudades y empresas, y la vista Medallion en vivo](assets/dashboard.png)
 
 *Datos reales de la VM: 6.931.820 mensajes crudos en Bronze → 2.024.632 personas
 consolidadas en Silver → 268.820 en Gold. Cada persona consolidada viene de ~3,4 mensajes.*
@@ -200,7 +200,7 @@ Envuelto en try/except para que un mensaje corrupto nunca mate al pipeline.
 ## Estructura del repositorio
 
 ```
-Proyecto1_modulo3_DE2/
+medallion-manager/
 ├── src/hr_etl/                 # Codigo fuente principal
 │   ├── __main__.py             # Entrypoint: wires infra + consume loop
 │   ├── config.py               # Configuracion 12-factor (pydantic-settings)
@@ -560,8 +560,8 @@ Tras analizar ~500k mensajes del generador, documentamos estos patrones:
 
 ```bash
 # 1. Clonar el repositorio (incluye el generador como submodule)
-git clone --recurse-submodules https://github.com/Bootcamp-IA-MAD-P7/Proyecto1_modulo3_DE2.git
-cd Proyecto1_modulo3_DE2
+git clone --recurse-submodules https://github.com/jzelada97/medallion-manager.git
+cd medallion-manager
 
 # 2. Arrancar el generador Kafka (caja negra)
 cd data-generator
@@ -597,11 +597,11 @@ docker ps
 
 ```bash
 # Mensajes crudos en MongoDB
-docker exec proyecto1_modulo3_de2-mongo-1 mongosh -u hr_user -p changeme --quiet \
+docker exec medallion-manager-mongo-1 mongosh -u hr_user -p changeme --quiet \
   --eval "db = db.getSiblingDB('hr_lake'); print(db.raw_messages.countDocuments())"
 
 # Personas consolidadas en PostgreSQL
-docker exec proyecto1_modulo3_de2-postgres-1 psql -U hr_user -d hr_warehouse \
+docker exec medallion-manager-postgres-1 psql -U hr_user -d hr_warehouse \
   -t -c "SELECT count(*) FROM persons;"
 
 # Stats via API

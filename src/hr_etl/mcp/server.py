@@ -98,7 +98,7 @@ def search_person(
 
 
 def explain_project() -> dict:
-    """Qué es HR Insights ETL, objetivo y niveles implementados."""
+    """Qué es Medallion Manager, objetivo y niveles implementados."""
     return {"content": _read_md("project")}
 
 
@@ -225,7 +225,7 @@ TOOLS_SCHEMA: list[dict] = [
         "type": "function",
         "function": {
             "name": "explain_project",
-            "description": "Explica qué es HR Insights ETL, su objetivo y niveles implementados.",
+            "description": "Explica qué es Medallion Manager, su objetivo y niveles implementados.",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },

@@ -1,6 +1,6 @@
-# HR Insights ETL — Qué es este proyecto
+# Medallion Manager — Qué es este proyecto
 
-HR Insights ETL es un sistema de ingeniería de datos en tiempo real construido como proyecto del Bootcamp de Ingeniería de Datos de Factoría F5 Madrid.
+Medallion Manager es un sistema de ingeniería de datos en tiempo real construido como proyecto del Bootcamp de Ingeniería de Datos de Factoría F5 Madrid.
 
 ## Objetivo
 Consumir mensajes fragmentados desde Apache Kafka, almacenarlos crudos en MongoDB (Data Lake), agrupar y normalizar los fragmentos de cada persona, y persistir el registro consolidado en PostgreSQL (Data Warehouse).

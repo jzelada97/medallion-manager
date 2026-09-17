@@ -1,4 +1,4 @@
-"""Streamlit frontend for HR Insights.
+"""Streamlit frontend for Medallion Manager.
 
 A simple but polished dashboard to explore the consolidated HR data served by the
 FastAPI backend. It uses the API's search, filters, pagination and /stats endpoint,
@@ -23,7 +23,7 @@ API_URL = os.getenv("API_URL", "http://localhost:8000")
 PAGE_SIZE_OPTIONS = [25, 50, 100, 250, 500]
 DEFAULT_PAGE_SIZE = 25
 
-st.set_page_config(page_title="HR Insights", page_icon="👥", layout="wide")
+st.set_page_config(page_title="Medallion Manager", page_icon="👥", layout="wide")
 
 
 # --------------------------------------------------------------------------- #
@@ -87,7 +87,7 @@ def api_get_cached(path: str, timeout: int = 30) -> dict | None:
 # --------------------------------------------------------------------------- #
 # Header + health
 # --------------------------------------------------------------------------- #
-st.title("👥 HR Insights")
+st.title("👥 Medallion Manager")
 st.caption("Consulta de personas consolidadas — HR Pro")
 
 health = api_get_cached("/health")

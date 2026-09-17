@@ -1,4 +1,4 @@
-# HR Insights ETL — Cómo se construyó
+# Medallion Manager — Cómo se construyó
 
 ## Decisiones técnicas importantes
 

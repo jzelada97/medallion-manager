@@ -1,7 +1,7 @@
 [project]
 name = "hr-etl"
 version = "0.1.0"
-description = "ETL pipeline for HR Insights: Kafka -> MongoDB (lake) -> PostgreSQL (warehouse)"
+description = "ETL pipeline for HR data (Medallion Manager): Kafka -> MongoDB (lake) -> PostgreSQL (warehouse)"
 requires-python = ">=3.12"
 dependencies = [
     "confluent-kafka==2.6.1",

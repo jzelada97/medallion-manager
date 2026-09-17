@@ -1,4 +1,4 @@
-# Caddy reverse proxy for the HR Insights ETL demo on an Oracle VM.
+# Caddy reverse proxy for the Medallion Manager demo on an Oracle VM.
 # {$DOMAIN} is injected from the environment (see docker-compose.prod.yml).
 # Caddy automatically provisions and renews HTTPS certificates via Let's Encrypt.
 

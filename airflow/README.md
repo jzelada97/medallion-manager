@@ -75,12 +75,12 @@ contraseña se fija sembrando el fichero
 
 ```powershell
 # Listar DAGs y comprobar que no hay errores de parseo
-docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow dags list
-docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow dags list-import-errors
+docker exec medallion-manager-airflow-scheduler-1 airflow dags list
+docker exec medallion-manager-airflow-scheduler-1 airflow dags list-import-errors
 
 # Ejecutar un task directamente (no necesita despausar el DAG)
-docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow tasks test hr_etl_refresh_gold refresh_gold_layer
-docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow tasks test hr_etl_reconciliation batch_reconciliation
+docker exec medallion-manager-airflow-scheduler-1 airflow tasks test hr_etl_refresh_gold refresh_gold_layer
+docker exec medallion-manager-airflow-scheduler-1 airflow tasks test hr_etl_reconciliation batch_reconciliation
 ```
 
 ## Apagar / limpiar
@@ -180,11 +180,11 @@ Sin esa variable, los workers intentarían `localhost:8080` y fallarían con
 
 ```powershell
 # Activar y disparar el DAG
-docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow dags unpause hr_etl_gold_eventdriven
-docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow dags trigger hr_etl_gold_eventdriven
+docker exec medallion-manager-airflow-scheduler-1 airflow dags unpause hr_etl_gold_eventdriven
+docker exec medallion-manager-airflow-scheduler-1 airflow dags trigger hr_etl_gold_eventdriven
 
 # Ver el estado de las tareas (sustituye <run_id> por el que devuelve el trigger)
-docker exec proyecto1_modulo3_de2-airflow-scheduler-1 `
+docker exec medallion-manager-airflow-scheduler-1 `
   airflow tasks states-for-dag-run hr_etl_gold_eventdriven <run_id>
 # -> wait_for_new_persons debería estar en estado 'deferred' si aún no hay 150 nuevas
 ```
@@ -193,7 +193,7 @@ Para forzar que se cumpla el umbral y ver el ciclo `deferred -> success` (insert
 personas de prueba con `created_at = NOW()`):
 
 ```powershell
-docker exec proyecto1_modulo3_de2-postgres-1 psql -U hr_user -d hr_warehouse -c `
+docker exec medallion-manager-postgres-1 psql -U hr_user -d hr_warehouse -c `
  "INSERT INTO persons (match_key, full_name, created_at, updated_at)
   SELECT 'test:trigger-'||g, 'Test '||g, NOW(), NOW() FROM generate_series(1,150) AS g;"
 ```
@@ -202,7 +202,7 @@ En el siguiente sondeo del triggerer (~30s) el sensor pasa a `success` y se ejec
 `refresh_gold_layer`. Limpieza de las filas de prueba:
 
 ```powershell
-docker exec proyecto1_modulo3_de2-postgres-1 psql -U hr_user -d hr_warehouse -c `
+docker exec medallion-manager-postgres-1 psql -U hr_user -d hr_warehouse -c `
  "DELETE FROM persons WHERE match_key LIKE 'test:trigger-%';"
 ```
 

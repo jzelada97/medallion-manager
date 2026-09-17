@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Idempotent redeploy of the HR Insights ETL stack on the Oracle VM.
+# Idempotent redeploy of the Medallion Manager stack on the Oracle VM.
 #
 # Run by the CD workflow (.github/workflows/deploy.yml) over SSH after CI passes,
 # or manually on the VM:  bash ~/hr-etl/deploy/deploy.sh

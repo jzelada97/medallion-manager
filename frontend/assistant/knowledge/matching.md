@@ -1,4 +1,4 @@
-# HR Insights ETL — Estrategia de Matching y Normalización
+# Medallion Manager — Estrategia de Matching y Normalización
 
 ## El problema
 Los mensajes del generador NO tienen un ID único global. Cada fragmento llega por separado (Personal, Location, Professional, Bank, Net) y hay que descubrir a qué persona pertenece.

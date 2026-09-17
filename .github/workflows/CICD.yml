@@ -108,7 +108,7 @@ jobs:
       - name: Wait for the Airflow scheduler to be ready
         run: |
           for i in $(seq 1 40); do
-            if docker exec proyecto1_modulo3_de2-airflow-scheduler-1 airflow version >/dev/null 2>&1; then
+            if docker exec medallion-manager-airflow-scheduler-1 airflow version >/dev/null 2>&1; then
               echo "scheduler ready"; exit 0
             fi
             echo "waiting for scheduler... ($i)"; sleep 10
