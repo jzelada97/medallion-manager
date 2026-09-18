@@ -596,8 +596,6 @@ def test_review_approve_endpoint_records_verdict(pg_session_factory):
         session.close()
 
 
-
-
 def test_review_endpoint_rejects_missing_person(pg_session_factory):
     """Reviewing a non-existent person id returns 404."""
     client = _api_client(pg_session_factory)

@@ -106,6 +106,7 @@ c2.metric("Con datos bancarios", stats.get("with_bank", 0))
 top_cities = stats.get("top_cities", [])
 c3.metric("Ciudades distintas (top)", len(top_cities))
 
+
 def _bar_chart(df: pd.DataFrame, category: str) -> alt.Chart:
     """Plain, non-interactive bar chart (category vs. "personas").
 
