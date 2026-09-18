@@ -119,10 +119,10 @@ _ENSURE_REVIEWS_TABLE_SQL = text(
 # ---------------------------------------------------------------------------
 #
 # Persons already RESOLVED by a human (person_reviews) are excluded from the eligible set,
-# so a reviewer's verdict is sticky across the 30-min full rebuild: an 'approved' canonical,
-# a 'distinct' homonym, or a 'merged' loser never resurfaces in the review pane. The join is
-# by ``match_key`` (the stable business key) — persons.id churns on reprocess, match_key does
-# not — so the decision holds even after a truncate + reload from the lake.
+# so a reviewer's verdict is sticky across the 30-min full rebuild: an 'approved' canonical
+# or a 'merged' loser never resurfaces in the review pane. The join is by ``match_key`` (the
+# stable business key) — persons.id churns on reprocess, match_key does not — so the
+# decision holds even after a truncate + reload from the lake.
 _BUILD_PN_SQL = text(
     f"""
     DROP TABLE IF EXISTS _recon_pn;
@@ -135,7 +135,7 @@ _BUILD_PN_SQL = text(
           AND NOT EXISTS (
               SELECT 1 FROM person_reviews r
               WHERE r.match_key = p.match_key
-                AND r.status IN ('approved', 'distinct', 'merged')
+                AND r.status IN ('approved', 'merged')
           );
     CREATE INDEX _recon_pn_norm ON _recon_pn (norm);
     ANALYZE _recon_pn;

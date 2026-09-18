@@ -422,7 +422,7 @@ def test_refresh_duplicate_groups_drops_singletons(pg_engine):
 
 
 def test_refresh_duplicate_groups_excludes_reviewed(pg_engine):
-    """A member already resolved in person_reviews (approved/distinct/merged) is excluded,
+    """A member already resolved in person_reviews (approved/merged) is excluded,
     so a group a human settled stops surfacing — even without a fresh reconcile."""
     init_gold_schema(pg_engine)
     prefix = uuid.uuid4().hex[:6]
@@ -441,9 +441,9 @@ def test_refresh_duplicate_groups_excludes_reviewed(pg_engine):
             gid,
             [(a.id, 1.0, "exact_name"), (b.id, 1.0, "exact_name"), (c.id, 1.0, "exact_name")],
         )
-        # A human marked B as a distinct person -> B drops out of the pending group.
+        # A human approved B as canonical -> B drops out of the pending group.
         session.execute(
-            text("INSERT INTO person_reviews (match_key, status) VALUES (:mk, 'distinct')"),
+            text("INSERT INTO person_reviews (match_key, status) VALUES (:mk, 'approved')"),
             {"mk": f"name:{prefix}-b"},
         )
         session.commit()

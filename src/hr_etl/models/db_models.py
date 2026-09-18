@@ -151,7 +151,7 @@ class PersonReview(Base):
     """A persistent HUMAN decision about a person record in the duplicate-review flow.
 
     The duplicate-consolidation flow surfaces ambiguous same-name candidates that the
-    automatic rules refuse to merge. A reviewer resolves each case with one of three
+    automatic rules refuse to merge. A reviewer resolves each case with one of two
     verdicts, recorded here so the decision SURVIVES a full reprocess from the lake and
     the 30-min ``duplicate_groups`` rebuild:
 
@@ -161,9 +161,6 @@ class PersonReview(Base):
     * ``approved`` — a reviewer confirmed this is the canonical, valid person. It is
       force-promoted to Gold even if its name repeats in Silver, and it leaves the
       review queue.
-    * ``distinct`` — a reviewer confirmed this is a DIFFERENT real person that merely
-      shares a name (a legitimate homonym). It leaves the review queue and no longer
-      blocks its same-name peers from Gold.
 
     Keyed by ``match_key`` (the deterministic, content-derived business key) rather than
     ``persons.id`` on purpose: ``persons.id`` is an autoincrement surrogate that would be
@@ -176,7 +173,7 @@ class PersonReview(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     # Stable, content-derived key of the reviewed person (survives a reprocess).
     match_key: Mapped[str] = mapped_column(String(255), unique=True, index=True)
-    # 'merged' | 'approved' | 'distinct'
+    # 'merged' | 'approved'
     status: Mapped[str] = mapped_column(String(32), index=True)
     # For 'merged': the match_key of the survivor this record was folded into.
     survivor_match_key: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)

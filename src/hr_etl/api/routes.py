@@ -253,6 +253,12 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
         recomputed on every page load / group select). Response shape is unchanged so the
         frontend needs no change. Returns an empty list if Gold has not been refreshed yet
         (or the table is absent on this backend) rather than erroring.
+
+        Members already resolved (``/review/approve``, a manual ``/consolidate``, or an
+        automatic merge) are filtered out of the JSON before it is returned, even though
+        the materialized table itself only catches up on the next refresh cycle. Without
+        this, a reviewer's action shows no change until the batch job runs, which reads
+        as the button doing nothing.
         """
         session = session_factory()
         try:
@@ -287,6 +293,29 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
                 }
                 for r in rows
             ]
+
+            all_ids = {m["person_id"] for g in groups for m in g["members"]}
+            reviewed_ids: set[int] = set()
+            if all_ids:
+                reviewed_ids = set(
+                    session.execute(
+                        select(PersonRow.id)
+                        .join(PersonReview, PersonReview.match_key == PersonRow.match_key)
+                        .where(PersonRow.id.in_(all_ids))
+                    )
+                    .scalars()
+                    .all()
+                )
+
+            if reviewed_ids:
+                filtered = []
+                for g in groups:
+                    members = [m for m in g["members"] if m["person_id"] not in reviewed_ids]
+                    if len(members) >= 2:
+                        g["members"] = members
+                        filtered.append(g)
+                groups = filtered
+
             return {
                 "total_groups": int(total),
                 "count": len(groups),
@@ -412,10 +441,10 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
     def _record_review(person_id: int, status: str, note: str | None) -> dict:
         """Resolve a person's stable match_key and upsert a person_reviews verdict.
 
-        Shared by /review/approve and /review/distinct. Keyed by ``match_key`` so the
-        decision survives a reprocess (persons.id churns; match_key does not). Idempotent:
-        re-reviewing the same person overwrites the prior verdict. 404 if the id is gone
-        (e.g. already merged away), 400 if the row has no match_key.
+        Used by /review/approve. Keyed by ``match_key`` so the decision survives a
+        reprocess (persons.id churns; match_key does not). Idempotent: re-reviewing the
+        same person overwrites the prior verdict. 404 if the id is gone (e.g. already
+        merged away), 400 if the row has no match_key.
         """
         session = session_factory()
         try:
@@ -447,16 +476,6 @@ def build_router(session_factory, mongo_count=None) -> APIRouter:
         gate is bypassed for approved rows), and reconcile stops surfacing it for review.
         """
         return _record_review(payload.person_id, "approved", payload.note)
-
-    @router.post("/review/distinct")
-    def review_distinct(payload: ReviewRequest) -> dict:
-        """Mark a person as a DIFFERENT real individual that merely shares a name.
-
-        Records status ``distinct`` in ``person_reviews``. The row leaves the review queue
-        and is ignored by the Gold name-uniqueness anti-join, so its legitimate same-name
-        peers are no longer blocked from Gold. The row itself is not auto-promoted.
-        """
-        return _record_review(payload.person_id, "distinct", payload.note)
 
     @router.get("/gold/stats")
     def gold_stats() -> dict:

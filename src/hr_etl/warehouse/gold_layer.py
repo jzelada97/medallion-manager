@@ -138,10 +138,6 @@ _FILLED_COUNT = " + ".join(
 #   * ``approved`` — a reviewer confirmed this exact row is the canonical person; it is
 #     force-promoted to Gold even if its name repeats (the automatic uniqueness test is
 #     bypassed for it). This is the "I checked it, it's the good one" verdict.
-#   * ``distinct`` — a reviewer confirmed a row is a DIFFERENT real person that merely
-#     shares a name (a legitimate homonym). Such rows are EXCLUDED from the collision
-#     count, so they no longer block their same-name peers from Gold. A ``distinct`` row
-#     is not itself auto-promoted (it still shares a name), only stops being an obstacle.
 # The override joins person_reviews by match_key (its stable business key), so decisions
 # survive a full reprocess even though persons.id churns.
 _APPROVED_PREDICATE = (
@@ -149,19 +145,17 @@ _APPROVED_PREDICATE = (
     "        WHERE r.match_key = p.match_key AND r.status = 'approved')"
 )
 
-# Automatic bar: five business fields + >= 7/8 completeness + a unique norm_name. The
-# uniqueness anti-join ignores peers that a human marked 'distinct' (legitimate homonyms),
-# so resolving one member of a same-name pair can free the other for Gold.
+# Automatic bar: five business fields + >= 7/8 completeness + a unique norm_name. Two
+# real people who happen to share a norm_name both stay blocked from Gold until a human
+# either approves one of them or consolidates/rejects the pair — there is no bulk
+# "these are different people" override.
 _AUTO_PREDICATE = (
     "p.full_name IS NOT NULL AND p.passport IS NOT NULL AND p.email IS NOT NULL "
     "AND p.city IS NOT NULL AND p.company IS NOT NULL "
     f"AND ({_FILLED_COUNT}) >= 7 "
     "AND p.norm_name IS NOT NULL "
     "AND NOT EXISTS (SELECT 1 FROM persons p2 "
-    "                WHERE p2.norm_name = p.norm_name AND p2.id <> p.id "
-    "                  AND NOT EXISTS (SELECT 1 FROM person_reviews r2 "
-    "                                  WHERE r2.match_key = p2.match_key "
-    "                                    AND r2.status = 'distinct'))"
+    "                WHERE p2.norm_name = p.norm_name AND p2.id <> p.id)"
 )
 
 # A row is Gold if a human approved it OR it clears the automatic bar. The approved branch
@@ -279,7 +273,7 @@ JOIN persons p ON p.id = dg.person_id
 WHERE NOT EXISTS (
     SELECT 1 FROM person_reviews r
     WHERE r.match_key = p.match_key
-      AND r.status IN ('approved', 'distinct', 'merged')
+      AND r.status IN ('approved', 'merged')
 )
 GROUP BY dg.group_id
 HAVING COUNT(*) >= 2;

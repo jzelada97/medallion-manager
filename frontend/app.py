@@ -11,6 +11,7 @@ import os
 import sys
 from pathlib import Path
 
+import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
@@ -105,6 +106,26 @@ c2.metric("Con datos bancarios", stats.get("with_bank", 0))
 top_cities = stats.get("top_cities", [])
 c3.metric("Ciudades distintas (top)", len(top_cities))
 
+def _bar_chart(df: pd.DataFrame, category: str) -> alt.Chart:
+    """Plain, non-interactive bar chart (category vs. "personas").
+
+    Built directly in Altair instead of ``st.bar_chart``: Streamlit's helper adds
+    zoom/pan scale bindings on top of the spec, and when the axis has few or
+    near-identical values Vega-Lite logs "Infinite extent" / "Scale bindings ..."
+    console warnings while trying to bind an interactive scale to it. A static chart
+    has no such binding, so the warning never fires.
+    """
+    return (
+        alt.Chart(df)
+        .mark_bar()
+        .encode(
+            x=alt.X(f"{category}:N", sort="-y", title=None),
+            y=alt.Y("personas:Q"),
+            tooltip=[category, "personas"],
+        )
+    )
+
+
 col_a, col_b = st.columns(2)
 with col_a:
     st.subheader("Top ciudades")
@@ -112,7 +133,7 @@ with col_a:
         df_cities = pd.DataFrame(top_cities).rename(
             columns={"value": "ciudad", "count": "personas"}
         )
-        st.bar_chart(df_cities.set_index("ciudad"))
+        st.altair_chart(_bar_chart(df_cities, "ciudad"), use_container_width=True)
     else:
         st.info("Sin datos todavía.")
 with col_b:
@@ -122,7 +143,7 @@ with col_b:
         df_comp = pd.DataFrame(top_companies).rename(
             columns={"value": "empresa", "count": "personas"}
         )
-        st.bar_chart(df_comp.set_index("empresa"))
+        st.altair_chart(_bar_chart(df_comp, "empresa"), use_container_width=True)
     else:
         st.info("Sin datos todavía.")
 
@@ -427,15 +448,13 @@ with tab_dupes:
                 f"**{len(group['members'])} personas**"
             )
             st.caption(
-                "Tres formas de resolver un caso, todas persistentes (sobreviven al "
+                "Dos formas de resolver un caso, ambas persistentes (sobreviven al "
                 "reprocesado y al rebuild de la reconciliación):\n\n"
                 "- **Consolidar (exactamente 2):** marca las dos filas que sean la "
                 "MISMA persona; se fusionan en una (sobrevive el id más bajo) y se "
                 "guarda la traza del merge.\n"
                 "- **✅ Aprobar como canónica:** esta fila es la buena y ya está "
-                "completa; se promociona a Gold aunque el nombre se repita.\n"
-                "- **🔀 Marcar como distinta:** es otra persona real con el mismo "
-                "nombre (homónimo); sale de la cola y deja de bloquear a sus pares."
+                "completa; se promociona a Gold aunque el nombre se repita."
             )
 
             # --- Detail + per-member actions, one column per member ---
@@ -469,34 +488,19 @@ with tab_dupes:
                     detail = api_get(f"/persons/{pid}")
                     if detail:
                         st.json(detail)
-                    # Per-member review actions (single person each).
-                    a_col, d_col = st.columns(2)
-                    with a_col:
-                        if st.button(
-                            "✅ Aprobar",
-                            key=f"approve_{gid}_{pid}",
-                            help="Marcar como canónica y promover a Gold",
-                        ):
-                            res = api_post("/review/approve", {"person_id": pid})
-                            if res is not None:
-                                st.success(
-                                    f"#{pid} aprobada como canónica. Entrará a Gold en el "
-                                    "próximo refresh."
-                                )
-                                st.rerun()
-                    with d_col:
-                        if st.button(
-                            "🔀 Distinta",
-                            key=f"distinct_{gid}_{pid}",
-                            help="Es otra persona con el mismo nombre (homónimo)",
-                        ):
-                            res = api_post("/review/distinct", {"person_id": pid})
-                            if res is not None:
-                                st.success(
-                                    f"#{pid} marcada como persona distinta. Sale de la cola "
-                                    "de duplicados."
-                                )
-                                st.rerun()
+                    # Per-member review action (single person).
+                    if st.button(
+                        "✅ Aprobar",
+                        key=f"approve_{gid}_{pid}",
+                        help="Marcar como canónica y promover a Gold",
+                    ):
+                        res = api_post("/review/approve", {"person_id": pid})
+                        if res is not None:
+                            st.success(
+                                f"#{pid} aprobada como canónica. Entrará a Gold en el "
+                                "próximo refresh."
+                            )
+                            st.rerun()
 
             st.divider()
             n_selected = len(selected_ids)

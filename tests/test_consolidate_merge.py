@@ -596,26 +596,6 @@ def test_review_approve_endpoint_records_verdict(pg_session_factory):
         session.close()
 
 
-def test_review_distinct_endpoint_records_verdict(pg_session_factory):
-    """POST /review/distinct upserts a 'distinct' verdict keyed by the person's match_key."""
-    session = pg_session_factory()
-    try:
-        a = _add_person(session, "name:dist-1", "nora vidal")
-        session.commit()
-    finally:
-        session.close()
-
-    client = _api_client(pg_session_factory)
-    resp = client.post("/review/distinct", json={"person_id": a.id})
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "distinct"
-
-    session = pg_session_factory()
-    try:
-        reviews = _reviews(session)
-        assert any(r.match_key == "name:dist-1" and r.status == "distinct" for r in reviews)
-    finally:
-        session.close()
 
 
 def test_review_endpoint_rejects_missing_person(pg_session_factory):

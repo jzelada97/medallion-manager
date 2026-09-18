@@ -893,12 +893,13 @@ completo. Las principales:
 4. **Fragmentos Net**: El fragmento Net (address + IPv4) raramente se une a otros porque depende
    de un match exacto de address, que pocas veces coincide.
 
-5. **Accion "Distinta" en revision de duplicados**: hoy marca la persona como registro
-   distinto en `person_reviews` y la saca de la cola. Falta el comportamiento completo de
-   *split/unmerge*: cuando la consolidacion unio por error fragmentos de personas diferentes
-   (p. ej. un Personal correcto con un Location/Professional que coincidio solo por nombre),
-   "Distinta" deberia deshacer esa union y separar el registro en sus fragmentos originales.
-   Pendiente de implementar.
+5. **Sin accion "split/unmerge"**: la revision de duplicados solo ofrece "Consolidar"
+   (fusionar 2 filas) y "Aprobar" (promocionar una fila como canonica). Se elimino la
+   accion "Distinta" que existia antes: solo marcaba el registro como distinto en
+   `person_reviews` y lo sacaba de la cola de revision, sin deshacer una consolidacion
+   previa. Deshacer una fusion ya hecha requeriria reconstruir los fragmentos originales
+   desde Bronze (MongoDB), ya que la fila perdedora se borra fisicamente de `persons` al
+   fusionar. No implementado.
 
 ### Ya implementado (nivel Experto)
 
